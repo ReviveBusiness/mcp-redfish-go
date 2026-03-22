@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -320,6 +322,8 @@ func (s *Server) Start(ctx context.Context) error {
 	switch s.config.MCP.Transport {
 	case config.MCPTransportStdio:
 		return s.startStdio(ctx)
+	case config.MCPTransportSSE:
+		return s.startSSE(ctx)
 	default:
 		return fmt.Errorf("unsupported transport: %s", s.config.MCP.Transport)
 	}
@@ -329,6 +333,55 @@ func (s *Server) Start(ctx context.Context) error {
 func (s *Server) startStdio(ctx context.Context) error {
 	transport := &mcp.StdioTransport{}
 	return s.mcpServer.Run(ctx, transport)
+}
+
+// startSSE starts the server with SSE (Server-Sent Events) HTTP transport.
+// The server listens on the configured MCP port and serves SSE connections,
+// allowing Context Forge or other MCP clients to connect directly without
+// an intermediate agentgateway process.
+func (s *Server) startSSE(ctx context.Context) error {
+	addr := fmt.Sprintf(":%d", s.config.MCP.Port)
+
+	handler := mcp.NewSSEHandler(func(request *http.Request) *mcp.Server {
+		return s.mcpServer
+	}, nil)
+
+	// Mount on /sse so Context Forge (and other MCP clients) can connect
+	// at the standard path. NewSSEHandler is a plain http.Handler — it
+	// serves on whatever path it is registered under.
+	mux := http.NewServeMux()
+	mux.Handle("/sse", handler)
+	mux.Handle("/sse/", handler)
+
+	// Health check endpoint for K8s liveness/readiness probes.
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	// Shut down gracefully when the context is cancelled.
+	// Use Shutdown (not Close) to let active SSE connections drain.
+	go func() {
+		<-ctx.Done()
+		s.logger.Info("Shutting down SSE server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			s.logger.Warn("SSE server shutdown error, forcing close", "error", err)
+			srv.Close()
+		}
+	}()
+
+	s.logger.Info("SSE server listening", "addr", addr, "path", "/sse")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("SSE server failed: %w", err)
+	}
+	return nil
 }
 
 // GetMCPServer returns the underlying MCP server

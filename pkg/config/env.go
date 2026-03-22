@@ -141,9 +141,15 @@ func loadMCPConfig() (*MCPConfig, error) {
 		}
 	}
 
+	mcpPort, err := getEnvInt("MCP_PORT", 8000, 1, 65535)
+	if err != nil {
+		return nil, err
+	}
+
 	config := &MCPConfig{
 		Transport: transport,
 		LogLevel:  getEnv("MCP_REDFISH_LOG_LEVEL", "INFO"),
+		Port:      mcpPort,
 	}
 
 	return config, nil

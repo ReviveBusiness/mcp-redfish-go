@@ -92,6 +92,7 @@ func (r *RedfishConfig) Validate() error {
 type MCPConfig struct {
 	Transport MCPTransport `json:"transport"`
 	LogLevel  string       `json:"log_level"`
+	Port      int          `json:"port,omitempty"` // Listen port for SSE/HTTP transports
 }
 
 // Validate validates the MCP configuration
@@ -104,6 +105,10 @@ func (m *MCPConfig) Validate() error {
 	validLogLevels := []string{"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 	if !slices.Contains(validLogLevels, strings.ToUpper(m.LogLevel)) {
 		return fmt.Errorf("invalid log_level: %s. Must be one of: %v", m.LogLevel, validLogLevels)
+	}
+
+	if m.Port != 0 && (m.Port < 1 || m.Port > 65535) {
+		return fmt.Errorf("port must be between 1 and 65535, got: %d", m.Port)
 	}
 
 	m.LogLevel = strings.ToUpper(m.LogLevel)
