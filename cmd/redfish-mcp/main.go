@@ -46,6 +46,10 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Ensure all Redfish sessions are logged out on exit, even if the
+	// process is killed by the parent (agentgateway closing stdin).
+	defer server.Close()
+
 	// Set up signal handling for graceful shutdown
 	ctx, cancel := signal.NotifyContext(context.Background(),
 		os.Interrupt, syscall.SIGTERM)
