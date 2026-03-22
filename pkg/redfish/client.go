@@ -150,6 +150,8 @@ func (c *Client) loginSession() error {
 
 // Logout ends the session by sending HTTP DELETE to the session resource URL.
 // iDRAC limits concurrent sessions to 4-6; failing to DELETE causes RAC0218 exhaustion.
+// Session fields are only cleared on a successful DELETE; errors are returned to the
+// caller so they can decide whether to retry or surface the leak.
 func (c *Client) Logout() error {
 	if c.sessionToken == "" {
 		return nil // No active session
@@ -161,31 +163,43 @@ func (c *Client) Logout() error {
 		return nil
 	}
 
-	// Send DELETE to the session URL to free the iDRAC session slot.
-	if c.sessionURL != "" {
-		req, err := http.NewRequest("DELETE", c.sessionURL, nil)
-		if err != nil {
-			c.logger.Warn("Failed to create logout request", "error", err)
-		} else {
-			req.Header.Set("X-Auth-Token", c.sessionToken)
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := c.httpClient.Do(req)
-			if err != nil {
-				c.logger.Warn("Logout DELETE request failed", "error", err)
-			} else {
-				resp.Body.Close()
-				if resp.StatusCode >= 400 {
-					c.logger.Warn("Logout returned non-success status",
-						"status", resp.StatusCode, "sessionURL", c.sessionURL)
-				} else {
-					c.logger.Info("Session deleted successfully", "sessionURL", c.sessionURL)
-				}
-			}
-		}
-	} else {
+	if c.sessionURL == "" {
 		c.logger.Warn("No session URL captured; cannot DELETE session — iDRAC slot may leak")
+		// Clear local state even though we cannot free the server-side slot.
+		c.sessionToken = ""
+		return fmt.Errorf("logout failed: no session URL available — iDRAC session slot may leak")
 	}
 
+	// Send DELETE to the session URL to free the iDRAC session slot.
+	req, err := http.NewRequest("DELETE", c.sessionURL, nil)
+	if err != nil {
+		// Do NOT clear state — the server-side session is still live.
+		return fmt.Errorf("logout failed: could not create DELETE request: %w", err)
+	}
+
+	req.Header.Set("X-Auth-Token", c.sessionToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		// Do NOT clear state — we cannot confirm the session was deleted.
+		return fmt.Errorf("logout DELETE request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		body, _ := io.ReadAll(resp.Body)
+		// Do NOT clear state — the DELETE was rejected by the server.
+		c.logger.Warn("Logout returned non-success status",
+			"status", resp.StatusCode, "sessionURL", c.sessionURL)
+		return &RedfishError{
+			Message: fmt.Sprintf("logout DELETE returned HTTP %d: %s", resp.StatusCode, string(body)),
+			Code:    resp.StatusCode,
+		}
+	}
+
+	// DELETE succeeded — safe to clear local session state.
+	c.logger.Info("Session deleted successfully", "sessionURL", c.sessionURL)
 	c.sessionToken = ""
 	c.sessionURL = ""
 	return nil
@@ -374,9 +388,9 @@ func (c *Client) addAuthHeaders(req *http.Request) error {
 
 // Close closes the client and cleans up resources
 func (c *Client) Close() error {
-	c.Logout()
+	err := c.Logout()
 	if c.httpClient != nil {
 		c.httpClient.CloseIdleConnections()
 	}
-	return nil
+	return err
 }

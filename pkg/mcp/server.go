@@ -108,51 +108,90 @@ func (s *Server) handleListServers(ctx context.Context, req *mcp.CallToolRequest
 
 // getClient returns a cached, authenticated Redfish client for serverAddr.
 // If no client exists yet it creates and logs in a new one.
-// On a 401 response the caller should call this again with forceRelogin=true.
-func (s *Server) getClient(serverAddr string, forceRelogin bool) (*redfish.Client, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if existing, ok := s.clients[serverAddr]; ok && !forceRelogin {
-		return existing, nil
+//
+// On a 401 response the caller should pass the client it received before as
+// staleClient so getClient can determine whether another goroutine has already
+// refreshed the session. If staleClient is nil this is a normal get-or-create.
+//
+// The mutex is NOT held during network I/O (Close / Login) to avoid blocking
+// other goroutines while waiting for the iDRAC to respond.
+func (s *Server) getClient(serverAddr string, staleClient *redfish.Client) (*redfish.Client, error) {
+	// Fast path: return the cached client when no refresh is needed.
+	if staleClient == nil {
+		s.mu.Lock()
+		existing, ok := s.clients[serverAddr]
+		s.mu.Unlock()
+		if ok {
+			return existing, nil
+		}
+	} else {
+		// Refresh path: check whether another goroutine already replaced the
+		// stale session while we were waiting to enter this function.
+		s.mu.Lock()
+		current, ok := s.clients[serverAddr]
+		s.mu.Unlock()
+		if ok && current != staleClient {
+			// Another goroutine already refreshed — return the new client.
+			return current, nil
+		}
 	}
 
-	// Close the stale client (if any) before replacing it.
-	if stale, ok := s.clients[serverAddr]; ok {
-		_ = stale.Close()
-		delete(s.clients, serverAddr)
-	}
-
+	// Need to create (or re-create) a client. Resolve config outside the lock.
 	hostConfig, found := s.hostManager.GetHostByAddress(serverAddr)
 	if !found {
 		return nil, fmt.Errorf("server %s not found in configuration", serverAddr)
 	}
 
 	clientConfig := s.createClientConfig(hostConfig)
-	client := redfish.NewClient(clientConfig, s.logger)
+	newClient := redfish.NewClient(clientConfig, s.logger)
 
-	if err := client.Login(); err != nil {
+	// Close the stale connection outside the lock — this is a network call.
+	if staleClient != nil {
+		if err := staleClient.Close(); err != nil {
+			s.logger.Warn("Error closing stale Redfish client", "server", serverAddr, "error", err)
+		}
+	}
+
+	// Login is also a network call — do it outside the lock.
+	if err := newClient.Login(); err != nil {
 		return nil, fmt.Errorf("failed to login to Redfish server %s: %w", serverAddr, err)
 	}
 
-	s.clients[serverAddr] = client
+	// Re-acquire the lock to store the new client.
+	// If another goroutine raced us here and already stored a fresh client,
+	// prefer theirs and discard ours to avoid leaking a duplicate session.
+	s.mu.Lock()
+	if current, ok := s.clients[serverAddr]; ok && staleClient != nil && current != staleClient {
+		s.mu.Unlock()
+		// Another goroutine won the race — close the client we just created.
+		if err := newClient.Close(); err != nil {
+			s.logger.Warn("Error closing redundant Redfish client", "server", serverAddr, "error", err)
+		}
+		return current, nil
+	}
+	s.clients[serverAddr] = newClient
+	s.mu.Unlock()
+
 	s.logger.Info("Redfish session established", "server", serverAddr)
-	return client, nil
+	return newClient, nil
 }
 
 // Close logs out all cached Redfish sessions, freeing iDRAC session slots.
+// The map is cleared under the lock, then each client is logged out without
+// holding the lock so network I/O does not block other goroutines.
 func (s *Server) Close() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	snapshot := s.clients
+	s.clients = make(map[string]*redfish.Client)
+	s.mu.Unlock()
 
-	for addr, client := range s.clients {
+	for addr, client := range snapshot {
 		if err := client.Close(); err != nil {
 			s.logger.Warn("Error closing Redfish client", "server", addr, "error", err)
 		} else {
 			s.logger.Info("Redfish session closed", "server", addr)
 		}
 	}
-	s.clients = make(map[string]*redfish.Client)
 }
 
 // handleGetResourceData handles the get_resource_data tool
@@ -166,7 +205,7 @@ func (s *Server) handleGetResourceData(ctx context.Context, req *mcp.CallToolReq
 	}
 
 	// Reuse a cached session to avoid exhausting iDRAC session slots.
-	client, err := s.getClient(serverAddr, false)
+	client, err := s.getClient(serverAddr, nil)
 	if err != nil {
 		return nil, GetResourceOutput{}, err
 	}
@@ -175,9 +214,10 @@ func (s *Server) handleGetResourceData(ctx context.Context, req *mcp.CallToolReq
 	response, err := client.GetWithHeaders(resourcePath)
 	if err != nil {
 		// On 401, the session token expired — re-login once and retry.
+		// Pass the stale client so getClient can detect a concurrent refresh.
 		if rfErr, ok := err.(*redfish.RedfishError); ok && rfErr.Code == 401 {
 			s.logger.Warn("Session expired, re-authenticating", "server", serverAddr)
-			client, err = s.getClient(serverAddr, true)
+			client, err = s.getClient(serverAddr, client)
 			if err != nil {
 				return nil, GetResourceOutput{}, fmt.Errorf("re-login failed: %w", err)
 			}
