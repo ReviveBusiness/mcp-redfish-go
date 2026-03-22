@@ -20,6 +20,7 @@ type Client struct {
 	baseURL      string
 	httpClient   *http.Client
 	sessionToken string
+	sessionURL   string // full URL of the session resource, used for DELETE on logout
 	logger       *slog.Logger
 }
 
@@ -117,33 +118,76 @@ func (c *Client) loginSession() error {
 		return fmt.Errorf("failed to decode session response: %w", err)
 	}
 
+	// Capture the session resource URL so we can DELETE it on logout.
+	// iDRAC returns the URL in the Location header (preferred) or @odata.id body field.
+	if loc := resp.Header.Get("Location"); loc != "" {
+		// Location may be a relative path — normalise to full URL.
+		if strings.HasPrefix(loc, "/") {
+			c.sessionURL = c.baseURL + loc
+		} else {
+			c.sessionURL = loc
+		}
+	} else if odataID, ok := sessionResp["@odata.id"].(string); ok && odataID != "" {
+		c.sessionURL = c.baseURL + odataID
+	}
+
 	// Extract X-Auth-Token from response headers
 	if token := resp.Header.Get("X-Auth-Token"); token != "" {
 		c.sessionToken = token
-		c.logger.Info("Session authentication successful")
+		c.logger.Info("Session authentication successful", "sessionURL", c.sessionURL)
 		return nil
 	}
 
 	// Fallback: try to extract from response body
 	if token, ok := sessionResp["token"].(string); ok {
 		c.sessionToken = token
-		c.logger.Info("Session authentication successful")
+		c.logger.Info("Session authentication successful", "sessionURL", c.sessionURL)
 		return nil
 	}
 
 	return fmt.Errorf("no session token found in response")
 }
 
-// Logout ends the session
+// Logout ends the session by sending HTTP DELETE to the session resource URL.
+// iDRAC limits concurrent sessions to 4-6; failing to DELETE causes RAC0218 exhaustion.
 func (c *Client) Logout() error {
 	if c.sessionToken == "" {
-		return nil // No session to logout from
+		return nil // No active session
 	}
 
-	// For session auth, we don't need to explicitly logout
-	// The session will expire on the server side
+	// For basic auth there is no server-side session to delete.
+	if c.config.AuthMethod == AuthMethodBasic {
+		c.sessionToken = ""
+		return nil
+	}
+
+	// Send DELETE to the session URL to free the iDRAC session slot.
+	if c.sessionURL != "" {
+		req, err := http.NewRequest("DELETE", c.sessionURL, nil)
+		if err != nil {
+			c.logger.Warn("Failed to create logout request", "error", err)
+		} else {
+			req.Header.Set("X-Auth-Token", c.sessionToken)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := c.httpClient.Do(req)
+			if err != nil {
+				c.logger.Warn("Logout DELETE request failed", "error", err)
+			} else {
+				resp.Body.Close()
+				if resp.StatusCode >= 400 {
+					c.logger.Warn("Logout returned non-success status",
+						"status", resp.StatusCode, "sessionURL", c.sessionURL)
+				} else {
+					c.logger.Info("Session deleted successfully", "sessionURL", c.sessionURL)
+				}
+			}
+		}
+	} else {
+		c.logger.Warn("No session URL captured; cannot DELETE session — iDRAC slot may leak")
+	}
+
 	c.sessionToken = ""
-	c.logger.Info("Session cleared")
+	c.sessionURL = ""
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -18,6 +19,11 @@ type Server struct {
 	config      *config.Config
 	hostManager *common.HostManager
 	logger      *slog.Logger
+
+	// clients caches one authenticated Redfish client per server address to
+	// avoid creating a new iDRAC session on every tool call (session exhaustion).
+	clients map[string]*redfish.Client
+	mu      sync.Mutex
 }
 
 // NewServer creates a new Redfish MCP server
@@ -45,6 +51,7 @@ func NewServer(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 		config:      cfg,
 		hostManager: hostManager,
 		logger:      logger,
+		clients:     make(map[string]*redfish.Client),
 	}
 
 	// Register tools
@@ -99,6 +106,55 @@ func (s *Server) handleListServers(ctx context.Context, req *mcp.CallToolRequest
 	return nil, ListServersOutput{Servers: addresses}, nil
 }
 
+// getClient returns a cached, authenticated Redfish client for serverAddr.
+// If no client exists yet it creates and logs in a new one.
+// On a 401 response the caller should call this again with forceRelogin=true.
+func (s *Server) getClient(serverAddr string, forceRelogin bool) (*redfish.Client, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if existing, ok := s.clients[serverAddr]; ok && !forceRelogin {
+		return existing, nil
+	}
+
+	// Close the stale client (if any) before replacing it.
+	if stale, ok := s.clients[serverAddr]; ok {
+		_ = stale.Close()
+		delete(s.clients, serverAddr)
+	}
+
+	hostConfig, found := s.hostManager.GetHostByAddress(serverAddr)
+	if !found {
+		return nil, fmt.Errorf("server %s not found in configuration", serverAddr)
+	}
+
+	clientConfig := s.createClientConfig(hostConfig)
+	client := redfish.NewClient(clientConfig, s.logger)
+
+	if err := client.Login(); err != nil {
+		return nil, fmt.Errorf("failed to login to Redfish server %s: %w", serverAddr, err)
+	}
+
+	s.clients[serverAddr] = client
+	s.logger.Info("Redfish session established", "server", serverAddr)
+	return client, nil
+}
+
+// Close logs out all cached Redfish sessions, freeing iDRAC session slots.
+func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for addr, client := range s.clients {
+		if err := client.Close(); err != nil {
+			s.logger.Warn("Error closing Redfish client", "server", addr, "error", err)
+		} else {
+			s.logger.Info("Redfish session closed", "server", addr)
+		}
+	}
+	s.clients = make(map[string]*redfish.Client)
+}
+
 // handleGetResourceData handles the get_resource_data tool
 func (s *Server) handleGetResourceData(ctx context.Context, req *mcp.CallToolRequest, input GetResourceInput) (*mcp.CallToolResult, GetResourceOutput, error) {
 	s.logger.Info("Handling get_resource_data request")
@@ -109,26 +165,27 @@ func (s *Server) handleGetResourceData(ctx context.Context, req *mcp.CallToolReq
 		return nil, GetResourceOutput{}, fmt.Errorf("invalid Redfish URL: %w", err)
 	}
 
-	// Find the server configuration
-	hostConfig, found := s.hostManager.GetHostByAddress(serverAddr)
-	if !found {
-		return nil, GetResourceOutput{}, fmt.Errorf("server %s not found in configuration", serverAddr)
+	// Reuse a cached session to avoid exhausting iDRAC session slots.
+	client, err := s.getClient(serverAddr, false)
+	if err != nil {
+		return nil, GetResourceOutput{}, err
 	}
 
-	// Create Redfish client
-	clientConfig := s.createClientConfig(hostConfig)
-	client := redfish.NewClient(clientConfig, s.logger)
-
-	// Login and fetch data
-	if err := client.Login(); err != nil {
-		return nil, GetResourceOutput{}, fmt.Errorf("failed to login to Redfish server: %w", err)
-	}
-	defer client.Close()
-
-	// Get resource data with headers
+	// Get resource data with headers.
 	response, err := client.GetWithHeaders(resourcePath)
 	if err != nil {
-		return nil, GetResourceOutput{}, fmt.Errorf("failed to get resource data: %w", err)
+		// On 401, the session token expired — re-login once and retry.
+		if rfErr, ok := err.(*redfish.RedfishError); ok && rfErr.Code == 401 {
+			s.logger.Warn("Session expired, re-authenticating", "server", serverAddr)
+			client, err = s.getClient(serverAddr, true)
+			if err != nil {
+				return nil, GetResourceOutput{}, fmt.Errorf("re-login failed: %w", err)
+			}
+			response, err = client.GetWithHeaders(resourcePath)
+		}
+		if err != nil {
+			return nil, GetResourceOutput{}, fmt.Errorf("failed to get resource data: %w", err)
+		}
 	}
 
 	return nil, GetResourceOutput{
