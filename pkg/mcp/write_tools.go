@@ -3,7 +3,9 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -11,6 +13,15 @@ import (
 
 	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/redfish"
 )
+
+// validateSubscriptionID rejects IDs that contain path-traversal or reserved
+// characters and returns a path-escaped segment safe for URL interpolation.
+func validateSubscriptionID(id string) (string, error) {
+	if id == "." || id == ".." || strings.Contains(id, "/") || strings.Contains(id, "\\") {
+		return "", fmt.Errorf("invalid subscription_id: %q", id)
+	}
+	return url.PathEscape(id), nil
+}
 
 // ---------------------------------------------------------------------------
 // Write safety: per-server mutex + rate limiting
@@ -548,7 +559,9 @@ func (s *Server) handleAlertAdd(serverAddr string, input SetAlertConfigInput) (*
 		body["EventTypes"] = input.EventTypes
 	}
 	if len(input.Severity) > 0 {
-		body["MessageSeverity"] = input.Severity
+		// Redfish MessageSeverity is a single enum string, not an array.
+		// Use the first (highest-priority) value from the user-provided list.
+		body["MessageSeverity"] = input.Severity[0]
 	}
 	if input.Context != "" {
 		body["Context"] = input.Context
@@ -578,6 +591,10 @@ func (s *Server) handleAlertRemove(serverAddr string, input SetAlertConfigInput)
 	if input.SubscriptionID == "" {
 		return nil, SetAlertConfigOutput{}, fmt.Errorf("subscription_id is required for action=remove")
 	}
+	escapedID, err := validateSubscriptionID(input.SubscriptionID)
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, err
+	}
 
 	// Rate limit + serialize writes per server
 	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
@@ -590,7 +607,7 @@ func (s *Server) handleAlertRemove(serverAddr string, input SetAlertConfigInput)
 
 	// NOTE: DELETE /redfish/v1/EventService/Subscriptions/{id} removes the subscription.
 	// Dell iDRAC returns 200 OK on successful deletion.
-	path := fmt.Sprintf("/redfish/v1/EventService/Subscriptions/%s", input.SubscriptionID)
+	path := fmt.Sprintf("/redfish/v1/EventService/Subscriptions/%s", escapedID)
 	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
 		return c.Delete(path)
 	})
@@ -673,6 +690,10 @@ func (s *Server) handleAlertUpdate(serverAddr string, input SetAlertConfigInput)
 	if input.SubscriptionID == "" {
 		return nil, SetAlertConfigOutput{}, fmt.Errorf("subscription_id is required for action=update")
 	}
+	escapedID, err := validateSubscriptionID(input.SubscriptionID)
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, err
+	}
 
 	// Validate optional protocol
 	if input.Protocol != "" && !slices.Contains(validAlertProtocols, input.Protocol) {
@@ -705,7 +726,9 @@ func (s *Server) handleAlertUpdate(serverAddr string, input SetAlertConfigInput)
 		body["EventTypes"] = input.EventTypes
 	}
 	if len(input.Severity) > 0 {
-		body["MessageSeverity"] = input.Severity
+		// Redfish MessageSeverity is a single enum string, not an array.
+		// Use the first (highest-priority) value from the user-provided list.
+		body["MessageSeverity"] = input.Severity[0]
 	}
 	if input.Context != "" {
 		body["Context"] = input.Context
@@ -726,7 +749,7 @@ func (s *Server) handleAlertUpdate(serverAddr string, input SetAlertConfigInput)
 
 	// NOTE: PATCH /redfish/v1/EventService/Subscriptions/{id} modifies an existing
 	// subscription. Dell iDRAC returns 200 OK with the updated subscription body.
-	path := fmt.Sprintf("/redfish/v1/EventService/Subscriptions/%s", input.SubscriptionID)
+	path := fmt.Sprintf("/redfish/v1/EventService/Subscriptions/%s", escapedID)
 	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
 		return c.Patch(path, body)
 	})

@@ -233,18 +233,8 @@ func (s *Server) getClient(serverAddr string, staleClient *redfish.Client) (*red
 		return nil, fmt.Errorf("failed to login to Redfish server %s: %w", serverAddr, err)
 	}
 
-	// Close the stale connection outside the lock — this is a network call.
-	// We do this AFTER the new client is verified working to avoid a window
-	// where no client is available.
-	if staleClient != nil {
-		if err := staleClient.Close(); err != nil {
-			s.logger.Warn("Error closing stale Redfish client", "server", serverAddr, "error", err)
-		}
-	}
-
-	// Re-acquire the lock to store the new client.
-	// If another goroutine raced us here and already stored a fresh client,
-	// prefer theirs and discard ours to avoid leaking a duplicate session.
+	// Publish the new client under the lock BEFORE closing the stale one.
+	// This ensures no goroutine can observe the stale client after it is closed.
 	s.mu.Lock()
 	if current, ok := s.clients[serverAddr]; ok && current != staleClient {
 		s.mu.Unlock()
@@ -256,6 +246,14 @@ func (s *Server) getClient(serverAddr string, staleClient *redfish.Client) (*red
 	}
 	s.clients[serverAddr] = newClient
 	s.mu.Unlock()
+
+	// Now retire the stale connection outside the lock — callers can no longer
+	// observe it because the cache already points to newClient.
+	if staleClient != nil {
+		if err := staleClient.Close(); err != nil {
+			s.logger.Warn("Error closing stale Redfish client", "server", serverAddr, "error", err)
+		}
+	}
 
 	s.logger.Info("Redfish session established", "server", serverAddr)
 	return newClient, nil
@@ -393,6 +391,28 @@ func (s *Server) createClientConfig(hostConfig config.HostConfig) *redfish.Clien
 	config.InsecureSkipVerify = s.config.Redfish.InsecureSkipVerify
 
 	return config
+}
+
+// buildProbeTLSConfig returns a tls.Config that mirrors the TLS settings used
+// by the main Redfish client (InsecureSkipVerify and, when implemented, the
+// global CA bundle). This ensures the /healthz probe can complete TLS
+// verification in environments that pin a private CA.
+func (s *Server) buildProbeTLSConfig() *tls.Config {
+	tlsCfg := &tls.Config{
+		MinVersion:         tls.VersionTLS12,
+		InsecureSkipVerify: s.config.Redfish.InsecureSkipVerify,
+	}
+
+	// Honor the global CA certificate when present. Per-host CA overrides are
+	// not used here because the probe iterates all hosts with a single client.
+	if s.config.Redfish.TLSServerCACert != "" {
+		// TODO: Load custom CA certificate into tlsCfg.RootCAs — mirrors the
+		// TODO in pkg/redfish/client.go NewClient(). Once that is implemented,
+		// extract a shared helper and call it from both sites.
+		s.logger.Warn("Custom CA certificate support not yet implemented for health probe")
+	}
+
+	return tlsCfg
 }
 
 // Start starts the MCP server with the specified transport
@@ -542,13 +562,12 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 
 	// Short-lived HTTP client with a tight timeout so the readiness probe
 	// does not block for 30 seconds per host.
+	// Reuse the same TLS construction as the main Redfish client so the probe
+	// honors TLSServerCACert when custom CA loading is implemented.
 	probeClient := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				MinVersion:         tls.VersionTLS12,
-				InsecureSkipVerify: s.config.Redfish.InsecureSkipVerify,
-			},
+			TLSClientConfig: s.buildProbeTLSConfig(),
 		},
 	}
 

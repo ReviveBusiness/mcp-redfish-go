@@ -931,10 +931,16 @@ func (s *Server) handleGetAlertConfig(ctx context.Context, req *mcp.CallToolRequ
 	// Fetch subscription members — Dell iDRAC path: /redfish/v1/EventService/Subscriptions
 	subMembers, err := s.collectMembers(serverAddr, "/redfish/v1/EventService/Subscriptions")
 	if err != nil {
-		// Non-fatal: return service info with empty subscriptions rather than failing entirely.
-		s.logger.Warn("Failed to fetch EventService subscriptions", "error", err)
-		observeTool("get_alert_config", start, nil)
-		return nil, GetAlertConfigOutput{EventService: svcInfo, Subscriptions: []AlertSubscription{}}, nil
+		// A 404 means the Subscriptions collection is unsupported — return empty list.
+		// Any other error (401, 5xx, network) is surfaced so callers can distinguish
+		// "no subscriptions" from "could not reach the BMC".
+		if rfErr, ok := err.(*redfish.RedfishError); ok && rfErr.Code == 404 {
+			s.logger.Info("EventService/Subscriptions not found — subscriptions unsupported", "server", serverAddr)
+			observeTool("get_alert_config", start, nil)
+			return nil, GetAlertConfigOutput{EventService: svcInfo, Subscriptions: []AlertSubscription{}}, nil
+		}
+		observeTool("get_alert_config", start, err)
+		return nil, GetAlertConfigOutput{}, fmt.Errorf("failed to fetch EventService subscriptions: %w", err)
 	}
 
 	var subs []AlertSubscription
@@ -1031,7 +1037,10 @@ func (s *Server) handleGetBiosSettings(ctx context.Context, req *mcp.CallToolReq
 			if rfErr, ok := err.(*redfish.RedfishError); ok && rfErr.Code == 404 {
 				s.logger.Info("Bios/Settings path not found on this iDRAC — no pending changes", "server", serverAddr)
 			} else {
-				s.logger.Warn("Failed to fetch pending BIOS settings", "server", serverAddr, "error", err)
+				// Transient errors (401, 5xx, network) are propagated so callers
+				// don't mistake a failure for "no pending changes".
+				observeTool("get_bios_settings", start, err)
+				return nil, GetBiosSettingsOutput{}, fmt.Errorf("failed to fetch pending BIOS settings: %w", err)
 			}
 		} else if pendingData, ok := pendingResp.Data.(map[string]interface{}); ok {
 			pendingAttrs, _ := pendingData["Attributes"].(map[string]interface{})
