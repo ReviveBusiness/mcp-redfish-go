@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -224,16 +225,21 @@ func (s *Server) getClient(serverAddr string, staleClient *redfish.Client) (*red
 	clientConfig := s.createClientConfig(hostConfig)
 	newClient := redfish.NewClient(clientConfig, s.logger)
 
+	// Login is a network call — do it outside the lock.
+	// We intentionally login the new client BEFORE closing the stale one so that
+	// if login fails we can keep using the stale client rather than leaving no
+	// usable client in the cache.
+	if err := newClient.Login(); err != nil {
+		return nil, fmt.Errorf("failed to login to Redfish server %s: %w", serverAddr, err)
+	}
+
 	// Close the stale connection outside the lock — this is a network call.
+	// We do this AFTER the new client is verified working to avoid a window
+	// where no client is available.
 	if staleClient != nil {
 		if err := staleClient.Close(); err != nil {
 			s.logger.Warn("Error closing stale Redfish client", "server", serverAddr, "error", err)
 		}
-	}
-
-	// Login is also a network call — do it outside the lock.
-	if err := newClient.Login(); err != nil {
-		return nil, fmt.Errorf("failed to login to Redfish server %s: %w", serverAddr, err)
 	}
 
 	// Re-acquire the lock to store the new client.
@@ -507,35 +513,36 @@ func (s *Server) startStreamableHTTP(ctx context.Context) error {
 	return nil
 }
 
-// handleHealthz is a smart readiness probe. If at least one Redfish host is
-// configured, it performs a quick GET to /redfish/v1/ on the first host. If
-// that fails, it returns 503 so K8s stops routing traffic to the pod.
+// hostHealthStatus represents the health check result for a single host.
+type hostHealthStatus struct {
+	Address   string `json:"address"`
+	Reachable bool   `json:"reachable"`
+	Error     string `json:"error,omitempty"`
+}
+
+// healthzResponse is the JSON response body for the /healthz endpoint.
+type healthzResponse struct {
+	Status string             `json:"status"` // "ok", "degraded", or "unavailable"
+	Hosts  []hostHealthStatus `json:"hosts"`
+}
+
+// handleHealthz is a smart readiness probe. It checks ALL configured Redfish
+// hosts and reports per-host status. Returns HTTP 200 if at least one host is
+// reachable (status "ok" or "degraded"), HTTP 503 only when ALL hosts are
+// unreachable (status "unavailable").
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	addrs := s.hostManager.GetAddresses()
 	if len(addrs) == 0 {
 		// No hosts configured — server is healthy but has nothing to probe.
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok (no hosts configured)"))
+		json.NewEncoder(w).Encode(healthzResponse{Status: "ok", Hosts: nil})
 		return
 	}
 
-	// Quick connectivity check — use a short-lived HTTP client with a tight
-	// timeout so the readiness probe does not block for 30 seconds.
-	addr := addrs[0]
-	hostCfg, found := s.hostManager.GetHostByAddress(addr)
-	if !found {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-		return
-	}
-
-	port := hostCfg.Port
-	if port == 0 {
-		port = s.config.Redfish.Port
-	}
-
-	probeURL := fmt.Sprintf("https://%s:%d/redfish/v1/", addr, port)
-	client := &http.Client{
+	// Short-lived HTTP client with a tight timeout so the readiness probe
+	// does not block for 30 seconds per host.
+	probeClient := &http.Client{
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
@@ -544,23 +551,68 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 			},
 		},
 	}
-	resp, err := client.Get(probeURL)
-	if err != nil {
-		s.logger.Warn("Healthz probe failed", "server", addr, "error", err)
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(fmt.Sprintf("iDRAC unreachable: %v", err)))
-		return
-	}
-	resp.Body.Close()
 
-	if resp.StatusCode >= 500 {
-		w.WriteHeader(http.StatusServiceUnavailable)
-		w.Write([]byte(fmt.Sprintf("iDRAC returned %d", resp.StatusCode)))
-		return
+	hosts := make([]hostHealthStatus, 0, len(addrs))
+	reachable := 0
+
+	for _, addr := range addrs {
+		hs := hostHealthStatus{Address: addr}
+
+		hostCfg, found := s.hostManager.GetHostByAddress(addr)
+		if !found {
+			// Host disappeared between GetAddresses and lookup — treat as
+			// reachable to avoid false negatives from a race condition.
+			hs.Reachable = true
+			reachable++
+			hosts = append(hosts, hs)
+			continue
+		}
+
+		port := hostCfg.Port
+		if port == 0 {
+			port = s.config.Redfish.Port
+		}
+
+		probeURL := fmt.Sprintf("https://%s:%d/redfish/v1/", addr, port)
+		resp, err := probeClient.Get(probeURL)
+		if err != nil {
+			s.logger.Warn("Healthz probe failed", "server", addr, "error", err)
+			hs.Reachable = false
+			hs.Error = err.Error()
+			hosts = append(hosts, hs)
+			continue
+		}
+		resp.Body.Close()
+
+		if resp.StatusCode >= 500 {
+			hs.Reachable = false
+			hs.Error = fmt.Sprintf("iDRAC returned %d", resp.StatusCode)
+			hosts = append(hosts, hs)
+			continue
+		}
+
+		hs.Reachable = true
+		reachable++
+		hosts = append(hosts, hs)
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("ok"))
+	var status string
+	var httpCode int
+	switch {
+	case reachable == len(addrs):
+		status = "ok"
+		httpCode = http.StatusOK
+	case reachable > 0:
+		status = "degraded"
+		httpCode = http.StatusOK
+	default:
+		status = "unavailable"
+		httpCode = http.StatusServiceUnavailable
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(httpCode)
+	json.NewEncoder(w).Encode(healthzResponse{Status: status, Hosts: hosts})
 }
 
 // GetMCPServer returns the underlying MCP server

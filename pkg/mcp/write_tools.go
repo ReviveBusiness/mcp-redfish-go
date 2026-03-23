@@ -80,6 +80,7 @@ func (l *writeLimiter) acquireWrite(serverAddr string) (release func(), recordSu
 
 // PowerActionInput represents input for the power_action tool.
 type PowerActionInput struct {
+	ServerAddressInput
 	ResetType string `json:"reset_type" jsonschema:"Reset type: On, ForceOff, ForceRestart, GracefulRestart, GracefulShutdown, PushPowerButton, Nmi, PowerCycle"`
 }
 
@@ -92,6 +93,7 @@ type PowerActionOutput struct {
 
 // SetBootOverrideInput represents input for the set_boot_override tool.
 type SetBootOverrideInput struct {
+	ServerAddressInput
 	Target  string `json:"target" jsonschema:"Boot target: None, Pxe, Cd, Hdd, BiosSetup, Utilities, UefiTarget, SDCard, UefiHttp"`
 	Enabled string `json:"enabled" jsonschema:"Override mode: Once, Continuous, Disabled"`
 }
@@ -103,8 +105,10 @@ type SetBootOverrideOutput struct {
 	Data       interface{} `json:"data,omitempty"`
 }
 
-// ClearEventLogInput is an empty struct — the tool takes no parameters.
-type ClearEventLogInput struct{}
+// ClearEventLogInput accepts an optional server address override.
+type ClearEventLogInput struct {
+	ServerAddressInput
+}
 
 // ClearEventLogOutput represents the result of clearing the event log.
 type ClearEventLogOutput struct {
@@ -115,7 +119,7 @@ type ClearEventLogOutput struct {
 
 // SetBiosSettingInput represents input for the set_bios_setting tool.
 type SetBiosSettingInput struct {
-	Host      string `json:"host" jsonschema:"BMC hostname from server config (required)"`
+	ServerAddressInput
 	Attribute string `json:"attribute" jsonschema:"BIOS attribute name to change, e.g. 'ProcVirtualization' (required)"`
 	Value     string `json:"value" jsonschema:"New value for the BIOS attribute, e.g. 'Enabled' (required)"`
 }
@@ -130,7 +134,7 @@ type SetBiosSettingOutput struct {
 
 // SetAlertConfigInput represents input for the set_alert_config tool.
 type SetAlertConfigInput struct {
-	Host           string   `json:"host" jsonschema:"BMC hostname from server config (required)"`
+	ServerAddressInput
 	Action         string   `json:"action" jsonschema:"Action to perform: list|add|remove|update"`
 	SubscriptionID string   `json:"subscription_id,omitempty" jsonschema:"Subscription ID, required for remove/update (e.g. 'SubscriptionId1')"`
 	Destination    string   `json:"destination,omitempty" jsonschema:"Target URL, required for add (e.g. 'snmp://10.0.0.1:162' or 'syslog://10.0.0.2:514')"`
@@ -288,7 +292,10 @@ func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest
 		return nil, PowerActionOutput{}, fmt.Errorf("invalid reset type: %s. Must be one of: %v", input.ResetType, validResetTypes)
 	}
 
-	serverAddr := s.hostManager.GetAddresses()[0]
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		return nil, PowerActionOutput{}, fmt.Errorf("no servers configured")
+	}
 
 	// Rate limit + serialize writes per server
 	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
@@ -355,7 +362,10 @@ func (s *Server) handleSetBootOverride(ctx context.Context, req *mcp.CallToolReq
 		return nil, SetBootOverrideOutput{}, fmt.Errorf("invalid boot override mode: %s. Must be one of: %v", input.Enabled, validBootEnabled)
 	}
 
-	serverAddr := s.hostManager.GetAddresses()[0]
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		return nil, SetBootOverrideOutput{}, fmt.Errorf("no servers configured")
+	}
 
 	// Rate limit + serialize writes per server
 	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
@@ -399,7 +409,10 @@ func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolReque
 		return nil, ClearEventLogOutput{}, err
 	}
 
-	serverAddr := s.hostManager.GetAddresses()[0]
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		return nil, ClearEventLogOutput{}, fmt.Errorf("no servers configured")
+	}
 
 	// Rate limit + serialize writes per server
 	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
@@ -454,16 +467,9 @@ func (s *Server) handleSetAlertConfig(ctx context.Context, req *mcp.CallToolRequ
 		return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid action: %s. Must be one of: %v", input.Action, validAlertActions)
 	}
 
-	// Resolve server address — use provided host or fall back to first configured server.
-	var serverAddr string
-	if input.Host != "" {
-		serverAddr = input.Host
-	} else {
-		addrs := s.hostManager.GetAddresses()
-		if len(addrs) == 0 {
-			return nil, SetAlertConfigOutput{}, fmt.Errorf("no servers configured")
-		}
-		serverAddr = addrs[0]
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("no servers configured")
 	}
 
 	switch input.Action {
@@ -623,16 +629,9 @@ func (s *Server) handleSetBiosSetting(ctx context.Context, req *mcp.CallToolRequ
 		return nil, SetBiosSettingOutput{}, fmt.Errorf("value is required")
 	}
 
-	// Resolve server address — use provided host or fall back to first configured server.
-	var serverAddr string
-	if input.Host != "" {
-		serverAddr = input.Host
-	} else {
-		addrs := s.hostManager.GetAddresses()
-		if len(addrs) == 0 {
-			return nil, SetBiosSettingOutput{}, fmt.Errorf("no servers configured")
-		}
-		serverAddr = addrs[0]
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		return nil, SetBiosSettingOutput{}, fmt.Errorf("no servers configured")
 	}
 
 	// Rate limit + serialize writes per server
