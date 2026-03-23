@@ -521,6 +521,7 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		Timeout: 5 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{
+				MinVersion:         tls.VersionTLS12,
 				InsecureSkipVerify: s.config.Redfish.InsecureSkipVerify,
 			},
 		},

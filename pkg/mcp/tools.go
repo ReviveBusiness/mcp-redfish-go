@@ -7,6 +7,7 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/redfish"
 )
@@ -15,27 +16,20 @@ import (
 // Prometheus metrics
 // ---------------------------------------------------------------------------
 
+// Prometheus metrics are registered via promauto to avoid duplicate registration
+// panics (e.g. when tests import this package multiple times).
 var (
-	toolCallsTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+	toolCallsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "redfish_mcp_tool_calls_total",
 		Help: "Total number of MCP tool calls",
 	}, []string{"tool", "status"})
 
-	toolDurationSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+	toolDurationSeconds = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "redfish_mcp_tool_duration_seconds",
 		Help:    "Duration of MCP tool calls in seconds",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"tool"})
-
-	sessionsActive = prometheus.NewGauge(prometheus.GaugeOpts{
-		Name: "redfish_mcp_sessions_active",
-		Help: "Number of active SSE sessions",
-	})
 )
-
-func init() {
-	prometheus.MustRegister(toolCallsTotal, toolDurationSeconds, sessionsActive)
-}
 
 // observeTool records metrics for a tool call.
 func observeTool(tool string, start time.Time, err error) {
@@ -64,28 +58,12 @@ func (s *Server) resolveServer(override string) string {
 	return addrs[0]
 }
 
-// fetchResource is a convenience wrapper: get client, GET url, retry on 401.
+// fetchResource is a convenience wrapper: GET path with 401 retry.
+// It delegates to withRetryOn401 to avoid duplicating the retry pattern.
 func (s *Server) fetchResource(serverAddr, path string) (*redfish.RedfishResponse, error) {
-	client, err := s.getClient(serverAddr, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	response, err := client.GetWithHeaders(path)
-	if err != nil {
-		if rfErr, ok := err.(*redfish.RedfishError); ok && rfErr.Code == 401 {
-			s.logger.Warn("Session expired, re-authenticating", "server", serverAddr)
-			client, err = s.getClient(serverAddr, client)
-			if err != nil {
-				return nil, fmt.Errorf("re-login failed: %w", err)
-			}
-			response, err = client.GetWithHeaders(path)
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-	return response, nil
+	return s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.GetWithHeaders(path)
+	})
 }
 
 // mapGet safely navigates a nested map[string]interface{}.

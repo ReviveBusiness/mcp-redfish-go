@@ -110,6 +110,7 @@ func loadRedfishConfig() (*RedfishConfig, error) {
 		return nil, err
 	}
 
+	readOnly := getEnvBool("REDFISH_READ_ONLY", true) // Default TRUE — write tools blocked unless explicitly disabled
 	config := &RedfishConfig{
 		Hosts:              hosts,
 		Port:               port,
@@ -118,7 +119,7 @@ func loadRedfishConfig() (*RedfishConfig, error) {
 		Password:           getEnv("REDFISH_PASSWORD", ""),
 		TLSServerCACert:    getEnv("REDFISH_SERVER_CA_CERT", ""),
 		InsecureSkipVerify: getEnvBool("REDFISH_INSECURE_SKIP_VERIFY", false),
-		ReadOnly:           getEnvBool("REDFISH_READ_ONLY", true), // Default TRUE — write tools blocked unless explicitly disabled
+		ReadOnly:           &readOnly,
 		DiscoveryEnabled:   getEnvBool("REDFISH_DISCOVERY_ENABLED", false),
 		DiscoveryInterval:  discoveryInterval,
 	}

@@ -260,28 +260,6 @@ func (c *Client) GetWithHeaders(resourcePath string) (*RedfishResponse, error) {
 	return resp, nil
 }
 
-// PostJSON sends a POST request with a JSON body and returns the response with headers.
-// It follows the same pattern as GetWithHeaders — auth headers are included automatically,
-// Content-Type is set to application/json, and non-2xx responses return a RedfishError.
-func (c *Client) PostJSON(path string, body interface{}) (*RedfishResponse, error) {
-	jsonData, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-	return c.request("POST", path, jsonData)
-}
-
-// PatchJSON sends a PATCH request with a JSON body and returns the response with headers.
-// It follows the same pattern as GetWithHeaders — auth headers are included automatically,
-// Content-Type is set to application/json, and non-2xx responses return a RedfishError.
-func (c *Client) PatchJSON(path string, body interface{}) (*RedfishResponse, error) {
-	jsonData, err := json.Marshal(body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request body: %w", err)
-	}
-	return c.request("PATCH", path, jsonData)
-}
-
 // request performs an HTTP request with retry logic
 func (c *Client) request(method, resourcePath string, body []byte) (*RedfishResponse, error) {
 	var lastResp *RedfishResponse

@@ -23,6 +23,12 @@ type writeLimiter struct {
 	writeMu  map[string]*sync.Mutex // per-server write serialization
 }
 
+// limiter is the global write rate limiter. It is in-memory and does not
+// persist across process restarts. It also does not coordinate across multiple
+// replicas — each instance maintains its own independent state. For single-
+// instance deployments (the intended use case) this is sufficient. Multi-
+// replica or persistent rate limiting would require an external store (e.g.
+// Redis) and is out of scope for this implementation.
 var limiter = &writeLimiter{
 	lastCall: make(map[string]time.Time),
 	writeMu:  make(map[string]*sync.Mutex),
@@ -31,8 +37,11 @@ var limiter = &writeLimiter{
 const writeRateLimitSeconds = 10 // minimum seconds between write ops per server
 
 // acquireWrite locks the per-server write mutex and enforces rate limiting.
-// Returns a release function that MUST be called when the write is complete.
-func (l *writeLimiter) acquireWrite(serverAddr string) (func(), error) {
+// Returns (release, recordSuccess, error). release MUST be called when the
+// write attempt is complete (whether success or failure). recordSuccess MUST be
+// called only after the write completes successfully — this updates the rate
+// limit timestamp so failed writes do not consume quota.
+func (l *writeLimiter) acquireWrite(serverAddr string) (release func(), recordSuccess func(), err error) {
 	l.mu.Lock()
 	if _, ok := l.writeMu[serverAddr]; !ok {
 		l.writeMu[serverAddr] = &sync.Mutex{}
@@ -52,16 +61,17 @@ func (l *writeLimiter) acquireWrite(serverAddr string) (func(), error) {
 		elapsed := time.Since(last)
 		if elapsed < time.Duration(writeRateLimitSeconds)*time.Second {
 			serverMu.Unlock()
-			return nil, fmt.Errorf("rate limited: write operations on %s allowed every %ds (last call %s ago)", serverAddr, writeRateLimitSeconds, elapsed.Round(time.Second))
+			return nil, nil, fmt.Errorf("rate limited: write operations on %s allowed every %ds (last call %s ago)", serverAddr, writeRateLimitSeconds, elapsed.Round(time.Second))
 		}
 	}
 
-	// Record this call time
-	l.mu.Lock()
-	l.lastCall[serverAddr] = time.Now()
-	l.mu.Unlock()
-
-	return func() { serverMu.Unlock() }, nil
+	// Rate limit timestamp is recorded by recordSuccess() only after the write
+	// completes successfully — failed writes must not consume quota.
+	return func() { serverMu.Unlock() }, func() {
+		l.mu.Lock()
+		l.lastCall[serverAddr] = time.Now()
+		l.mu.Unlock()
+	}, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -149,7 +159,7 @@ func (s *Server) registerWriteTools() {
 
 // checkReadOnly returns an error when REDFISH_READ_ONLY is true (the default).
 func (s *Server) checkReadOnly(operation string) error {
-	if s.config.Redfish.ReadOnly {
+	if s.config.Redfish.ReadOnlyValue() {
 		return fmt.Errorf("write operations disabled: REDFISH_READ_ONLY=true (default). Set REDFISH_READ_ONLY=false to enable %s", operation)
 	}
 	return nil
@@ -190,6 +200,9 @@ func (s *Server) withRetryOn401(serverAddr string, fn func(c *redfish.Client) (*
 // ---------------------------------------------------------------------------
 
 // getCurrentPowerState fetches the current power state of the server.
+// NOTE: /redfish/v1/Systems/System.Embedded.1 is a Dell iDRAC-specific path.
+// Other BMC implementations may use a different Systems member identifier.
+// This path could be made configurable in a future release.
 func (s *Server) getCurrentPowerState(serverAddr string) (string, error) {
 	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
 		return c.GetWithHeaders("/redfish/v1/Systems/System.Embedded.1")
@@ -222,7 +235,7 @@ func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest
 	serverAddr := s.hostManager.GetAddresses()[0]
 
 	// Rate limit + serialize writes per server
-	release, err := limiter.acquireWrite(serverAddr)
+	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
 	if err != nil {
 		return nil, PowerActionOutput{}, err
 	}
@@ -249,8 +262,11 @@ func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest
 	// Log at Warn — all write operations are auditable.
 	s.logger.Warn("Executing power action", "server", serverAddr, "reset_type", input.ResetType, "current_state", currentState)
 
+	// NOTE: /redfish/v1/Systems/System.Embedded.1/Actions/ComputerSystem.Reset is a
+	// Dell iDRAC-specific path. Other BMC implementations may use a different Systems
+	// member identifier. This path could be made configurable in a future release.
 	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
-		return c.PostJSON(
+		return c.Post(
 			"/redfish/v1/Systems/System.Embedded.1/Actions/ComputerSystem.Reset",
 			map[string]string{"ResetType": input.ResetType},
 		)
@@ -258,6 +274,7 @@ func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest
 	if err != nil {
 		return nil, PowerActionOutput{}, fmt.Errorf("power action failed: %w", err)
 	}
+	recordSuccess()
 
 	return nil, PowerActionOutput{
 		StatusCode: response.StatusCode,
@@ -285,7 +302,7 @@ func (s *Server) handleSetBootOverride(ctx context.Context, req *mcp.CallToolReq
 	serverAddr := s.hostManager.GetAddresses()[0]
 
 	// Rate limit + serialize writes per server
-	release, err := limiter.acquireWrite(serverAddr)
+	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
 	if err != nil {
 		return nil, SetBootOverrideOutput{}, err
 	}
@@ -300,12 +317,16 @@ func (s *Server) handleSetBootOverride(ctx context.Context, req *mcp.CallToolReq
 		},
 	}
 
+	// NOTE: /redfish/v1/Systems/System.Embedded.1 is a Dell iDRAC-specific path.
+	// Other BMC implementations may use a different Systems member identifier.
+	// This path could be made configurable in a future release.
 	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
-		return c.PatchJSON("/redfish/v1/Systems/System.Embedded.1", body)
+		return c.Patch("/redfish/v1/Systems/System.Embedded.1", body)
 	})
 	if err != nil {
 		return nil, SetBootOverrideOutput{}, fmt.Errorf("set boot override failed: %w", err)
 	}
+	recordSuccess()
 
 	return nil, SetBootOverrideOutput{
 		StatusCode: response.StatusCode,
@@ -325,7 +346,7 @@ func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolReque
 	serverAddr := s.hostManager.GetAddresses()[0]
 
 	// Rate limit + serialize writes per server
-	release, err := limiter.acquireWrite(serverAddr)
+	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
 	if err != nil {
 		return nil, ClearEventLogOutput{}, err
 	}
@@ -333,8 +354,11 @@ func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolReque
 
 	s.logger.Warn("Clearing iDRAC System Event Log", "server", serverAddr)
 
+	// NOTE: /redfish/v1/Managers/iDRAC.Embedded.1/LogServices/Sel/Actions/LogService.ClearLog
+	// is a Dell iDRAC-specific path. Other BMC implementations may expose a different
+	// Manager identifier or log service path. This could be made configurable in a future release.
 	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
-		return c.PostJSON(
+		return c.Post(
 			"/redfish/v1/Managers/iDRAC.Embedded.1/LogServices/Sel/Actions/LogService.ClearLog",
 			map[string]string{},
 		)
@@ -342,6 +366,7 @@ func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolReque
 	if err != nil {
 		return nil, ClearEventLogOutput{}, fmt.Errorf("clear event log failed: %w", err)
 	}
+	recordSuccess()
 
 	return nil, ClearEventLogOutput{
 		StatusCode: response.StatusCode,

@@ -61,9 +61,21 @@ type RedfishConfig struct {
 	Password           string       `json:"password"`
 	TLSServerCACert    string       `json:"tls_server_ca_cert,omitempty"`
 	InsecureSkipVerify bool         `json:"insecure_skip_verify"`
-	ReadOnly           bool         `json:"read_only"`
-	DiscoveryEnabled   bool         `json:"discovery_enabled"`
-	DiscoveryInterval  int          `json:"discovery_interval"`
+	// ReadOnly uses a pointer so JSON loading can detect whether the field was
+	// explicitly set. When omitted from the JSON file, it defaults to true (safe).
+	// Use ReadOnlyValue() to get the effective boolean.
+	ReadOnly          *bool `json:"read_only,omitempty"`
+	DiscoveryEnabled  bool  `json:"discovery_enabled"`
+	DiscoveryInterval int   `json:"discovery_interval"`
+}
+
+// ReadOnlyValue returns the effective read-only setting.
+// Defaults to true (safe) when not explicitly set in JSON config.
+func (r *RedfishConfig) ReadOnlyValue() bool {
+	if r.ReadOnly == nil {
+		return true
+	}
+	return *r.ReadOnly
 }
 
 // Validate validates the Redfish configuration
