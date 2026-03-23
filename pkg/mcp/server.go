@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/common"
 	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/config"
@@ -87,10 +89,64 @@ func (s *Server) registerTools() error {
 	// Register get_resource_data tool
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "get_resource_data",
-		Description: "Fetch data from a specific Redfish resource",
+		Description: "Fetch data from a specific Redfish resource. Returns raw Redfish JSON with HTTP headers for any valid resource URL.",
 	}, s.handleGetResourceData)
 
-	s.logger.Info("MCP tools registered successfully")
+	// Register get_system_health tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_system_health",
+		Description: "Get system health summary including power state, CPU, memory, and component rollup statuses. Returns model, power state, overall health, CPU/memory summaries, and Dell OEM rollup statuses.",
+	}, s.handleGetSystemHealth)
+
+	// Register get_event_log tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_event_log",
+		Description: "Get iDRAC System Event Log entries for hardware event investigation. Returns entries with Id, Created timestamp, Message, Severity, and MessageId. Accepts optional count parameter (default 50, max 200).",
+	}, s.handleGetEventLog)
+
+	// Register get_thermal_data tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_thermal_data",
+		Description: "Get thermal data including temperatures and fan speeds. Returns temperature sensor readings (name, celsius, health) and fan readings (name, RPM/percent, health).",
+	}, s.handleGetThermalData)
+
+	// Register get_power_data tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_power_data",
+		Description: "Get power supply status and power consumption data. Returns power supply details (name, output watts, health, input voltage) and power control (consumed watts, capacity watts).",
+	}, s.handleGetPowerData)
+
+	// Register get_storage_data tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_storage_data",
+		Description: "Get storage controller and drive health data including predictive failure indicators. Returns controllers (name, health, RAID types) and drives (name, capacity, media type, health, predicted life remaining).",
+	}, s.handleGetStorageData)
+
+	// Register get_network_interfaces tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_network_interfaces",
+		Description: "Get network interface status, MAC addresses, and link speeds. Returns each interface's Id, name, MAC address, speed in Mbps, health, link status, and IPv4 addresses.",
+	}, s.handleGetNetworkInterfaces)
+
+	// Register get_memory_data tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_memory_data",
+		Description: "Get memory DIMM details including health status and ECC information. Returns each DIMM's name, capacity in MiB, device type, operating speed in MHz, health, and error correction type.",
+	}, s.handleGetMemoryData)
+
+	// Register get_firmware_inventory tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_firmware_inventory",
+		Description: "Get firmware versions for BIOS, iDRAC, NIC, and other components. Returns each component's Id, name, version, and whether it is updateable.",
+	}, s.handleGetFirmwareInventory)
+
+	// Register discover_resources tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "discover_resources",
+		Description: "Discover available Redfish API resource endpoints on the server. Returns all top-level resource links (Systems, Chassis, Managers, etc.) with their @odata.id paths.",
+	}, s.handleDiscoverResources)
+
+	s.logger.Info("MCP tools registered successfully", "count", 11)
 	return nil
 }
 
@@ -355,11 +411,11 @@ func (s *Server) startSSE(ctx context.Context) error {
 	mux.Handle("/sse", handler)
 	mux.Handle("/sse/", handler)
 
-	// Health check endpoint for K8s liveness/readiness probes.
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
-	})
+	// Smart readiness probe: checks iDRAC reachability when a host is configured.
+	mux.HandleFunc("/healthz", s.handleHealthz)
+
+	// Prometheus metrics endpoint.
+	mux.Handle("/metrics", promhttp.Handler())
 
 	srv := &http.Server{
 		Addr:    addr,
@@ -384,6 +440,61 @@ func (s *Server) startSSE(ctx context.Context) error {
 		return fmt.Errorf("SSE server failed: %w", err)
 	}
 	return nil
+}
+
+// handleHealthz is a smart readiness probe. If at least one Redfish host is
+// configured, it performs a quick GET to /redfish/v1/ on the first host. If
+// that fails, it returns 503 so K8s stops routing traffic to the pod.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	addrs := s.hostManager.GetAddresses()
+	if len(addrs) == 0 {
+		// No hosts configured — server is healthy but has nothing to probe.
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok (no hosts configured)"))
+		return
+	}
+
+	// Quick connectivity check — use a short-lived HTTP client with a tight
+	// timeout so the readiness probe does not block for 30 seconds.
+	addr := addrs[0]
+	hostCfg, found := s.hostManager.GetHostByAddress(addr)
+	if !found {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("ok"))
+		return
+	}
+
+	port := hostCfg.Port
+	if port == 0 {
+		port = s.config.Redfish.Port
+	}
+
+	probeURL := fmt.Sprintf("https://%s:%d/redfish/v1/", addr, port)
+	client := &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: s.config.Redfish.InsecureSkipVerify,
+			},
+		},
+	}
+	resp, err := client.Get(probeURL)
+	if err != nil {
+		s.logger.Warn("Healthz probe failed", "server", addr, "error", err)
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(fmt.Sprintf("iDRAC unreachable: %v", err)))
+		return
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(fmt.Sprintf("iDRAC returned %d", resp.StatusCode)))
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte("ok"))
 }
 
 // GetMCPServer returns the underlying MCP server
