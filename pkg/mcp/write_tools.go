@@ -4,11 +4,65 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/redfish"
 )
+
+// ---------------------------------------------------------------------------
+// Write safety: per-server mutex + rate limiting
+// ---------------------------------------------------------------------------
+
+// writeLimiter tracks per-server write mutex and rate limiting.
+type writeLimiter struct {
+	mu       sync.Mutex
+	lastCall map[string]time.Time // per-server last write timestamp
+	writeMu  map[string]*sync.Mutex // per-server write serialization
+}
+
+var limiter = &writeLimiter{
+	lastCall: make(map[string]time.Time),
+	writeMu:  make(map[string]*sync.Mutex),
+}
+
+const writeRateLimitSeconds = 10 // minimum seconds between write ops per server
+
+// acquireWrite locks the per-server write mutex and enforces rate limiting.
+// Returns a release function that MUST be called when the write is complete.
+func (l *writeLimiter) acquireWrite(serverAddr string) (func(), error) {
+	l.mu.Lock()
+	if _, ok := l.writeMu[serverAddr]; !ok {
+		l.writeMu[serverAddr] = &sync.Mutex{}
+	}
+	serverMu := l.writeMu[serverAddr]
+	l.mu.Unlock()
+
+	// Serialize writes per server — prevents concurrent boot override + power action races.
+	serverMu.Lock()
+
+	// Check rate limit
+	l.mu.Lock()
+	last, ok := l.lastCall[serverAddr]
+	l.mu.Unlock()
+
+	if ok {
+		elapsed := time.Since(last)
+		if elapsed < time.Duration(writeRateLimitSeconds)*time.Second {
+			serverMu.Unlock()
+			return nil, fmt.Errorf("rate limited: write operations on %s allowed every %ds (last call %s ago)", serverAddr, writeRateLimitSeconds, elapsed.Round(time.Second))
+		}
+	}
+
+	// Record this call time
+	l.mu.Lock()
+	l.lastCall[serverAddr] = time.Now()
+	l.mu.Unlock()
+
+	return func() { serverMu.Unlock() }, nil
+}
 
 // ---------------------------------------------------------------------------
 // Input / Output structs
@@ -135,6 +189,23 @@ func (s *Server) withRetryOn401(serverAddr string, fn func(c *redfish.Client) (*
 // Handlers
 // ---------------------------------------------------------------------------
 
+// getCurrentPowerState fetches the current power state of the server.
+func (s *Server) getCurrentPowerState(serverAddr string) (string, error) {
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.GetWithHeaders("/redfish/v1/Systems/System.Embedded.1")
+	})
+	if err != nil {
+		return "", err
+	}
+
+	if data, ok := response.Data.(map[string]interface{}); ok {
+		if ps, ok := data["PowerState"].(string); ok {
+			return ps, nil
+		}
+	}
+	return "Unknown", nil
+}
+
 // handlePowerAction executes a ComputerSystem.Reset action on the first
 // configured server.
 func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest, input PowerActionInput) (*mcp.CallToolResult, PowerActionOutput, error) {
@@ -150,8 +221,33 @@ func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest
 
 	serverAddr := s.hostManager.GetAddresses()[0]
 
+	// Rate limit + serialize writes per server
+	release, err := limiter.acquireWrite(serverAddr)
+	if err != nil {
+		return nil, PowerActionOutput{}, err
+	}
+	defer release()
+
+	// Pre-check: get current power state to warn on no-ops
+	currentState, err := s.getCurrentPowerState(serverAddr)
+	if err != nil {
+		s.logger.Warn("Could not determine current power state, proceeding anyway", "server", serverAddr, "error", err)
+	} else {
+		// Warn on redundant actions
+		if currentState == "On" && input.ResetType == "On" {
+			return nil, PowerActionOutput{
+				Message: fmt.Sprintf("Server is already powered On — no action taken"),
+			}, nil
+		}
+		if currentState == "Off" && (input.ResetType == "ForceOff" || input.ResetType == "GracefulShutdown") {
+			return nil, PowerActionOutput{
+				Message: fmt.Sprintf("Server is already powered Off — no action taken"),
+			}, nil
+		}
+	}
+
 	// Log at Warn — all write operations are auditable.
-	s.logger.Warn("Executing power action", "server", serverAddr, "reset_type", input.ResetType)
+	s.logger.Warn("Executing power action", "server", serverAddr, "reset_type", input.ResetType, "current_state", currentState)
 
 	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
 		return c.PostJSON(
@@ -165,7 +261,7 @@ func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest
 
 	return nil, PowerActionOutput{
 		StatusCode: response.StatusCode,
-		Message:    fmt.Sprintf("Power action %s executed successfully", input.ResetType),
+		Message:    fmt.Sprintf("Power action %s executed successfully (was %s)", input.ResetType, currentState),
 		Data:       response.Data,
 	}, nil
 }
@@ -187,6 +283,13 @@ func (s *Server) handleSetBootOverride(ctx context.Context, req *mcp.CallToolReq
 	}
 
 	serverAddr := s.hostManager.GetAddresses()[0]
+
+	// Rate limit + serialize writes per server
+	release, err := limiter.acquireWrite(serverAddr)
+	if err != nil {
+		return nil, SetBootOverrideOutput{}, err
+	}
+	defer release()
 
 	s.logger.Warn("Setting boot override", "server", serverAddr, "target", input.Target, "enabled", input.Enabled)
 
@@ -220,6 +323,13 @@ func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolReque
 	}
 
 	serverAddr := s.hostManager.GetAddresses()[0]
+
+	// Rate limit + serialize writes per server
+	release, err := limiter.acquireWrite(serverAddr)
+	if err != nil {
+		return nil, ClearEventLogOutput{}, err
+	}
+	defer release()
 
 	s.logger.Warn("Clearing iDRAC System Event Log", "server", serverAddr)
 
