@@ -40,7 +40,7 @@ func NewServer(cfg *config.Config, logger *slog.Logger) (*Server, error) {
 	mcpServer := mcp.NewServer(
 		&mcp.Implementation{
 			Name:    "redfish-mcp",
-			Version: "0.1.0",
+			Version: "0.4.0",
 		},
 		&mcp.ServerOptions{
 			// Configure based on transport
@@ -384,7 +384,7 @@ func (s *Server) Start(ctx context.Context) error {
 	case config.MCPTransportSSE:
 		return s.startSSE(ctx)
 	case config.MCPTransportStreamableHTTP:
-		return fmt.Errorf("streamable-http transport not yet implemented (planned for next release)")
+		return s.startStreamableHTTP(ctx)
 	default:
 		return fmt.Errorf("unsupported transport: %s", s.config.MCP.Transport)
 	}
@@ -441,6 +441,50 @@ func (s *Server) startSSE(ctx context.Context) error {
 	s.logger.Info("SSE server listening", "addr", addr, "path", "/sse")
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("SSE server failed: %w", err)
+	}
+	return nil
+}
+
+// startStreamableHTTP starts the server with Streamable HTTP transport.
+// This is the recommended transport per MCP spec v2025-03-26, replacing SSE.
+// Clients POST JSON-RPC to /mcp and receive responses as application/json
+// or text/event-stream (for streaming).
+func (s *Server) startStreamableHTTP(ctx context.Context) error {
+	addr := fmt.Sprintf(":%d", s.config.MCP.Port)
+
+	handler := mcp.NewStreamableHTTPHandler(func(request *http.Request) *mcp.Server {
+		return s.mcpServer
+	}, nil)
+
+	mux := http.NewServeMux()
+	mux.Handle("/mcp", handler)
+	mux.Handle("/mcp/", handler)
+
+	// Smart readiness probe: checks iDRAC reachability.
+	mux.HandleFunc("/healthz", s.handleHealthz)
+
+	// Prometheus metrics endpoint.
+	mux.Handle("/metrics", promhttp.Handler())
+
+	srv := &http.Server{
+		Addr:    addr,
+		Handler: mux,
+	}
+
+	go func() {
+		<-ctx.Done()
+		s.logger.Info("Shutting down Streamable HTTP server")
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			s.logger.Warn("Streamable HTTP server shutdown error, forcing close", "error", err)
+			srv.Close()
+		}
+	}()
+
+	s.logger.Info("Streamable HTTP server listening", "addr", addr, "path", "/mcp")
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		return fmt.Errorf("streamable HTTP server failed: %w", err)
 	}
 	return nil
 }
