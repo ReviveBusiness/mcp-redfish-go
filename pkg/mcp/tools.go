@@ -338,6 +338,35 @@ type GetAlertConfigOutput struct {
 	Subscriptions []AlertSubscription `json:"subscriptions"`
 }
 
+// -- get_bios_settings -------------------------------------------------------
+
+// GetBiosSettingsInput is the input for the get_bios_settings tool.
+// Dell iDRAC BIOS resource:         /redfish/v1/Systems/System.Embedded.1/Bios
+// Pending (staged) BIOS changes:    /redfish/v1/Systems/System.Embedded.1/Bios/Settings
+type GetBiosSettingsInput struct {
+	ServerAddressInput
+	IncludePending bool `json:"include_pending,omitempty" jsonschema:"Also return pending BIOS changes that have not yet been applied (require a reboot to take effect). Default false."`
+}
+
+// GetBiosSettingsOutput holds current BIOS attributes and optionally the
+// pending (staged) attribute changes awaiting the next reboot.
+type GetBiosSettingsOutput struct {
+	// Attributes contains current BIOS attribute key/value pairs returned by
+	// /redfish/v1/Systems/System.Embedded.1/Bios.  Key attributes include:
+	//   BootMode             - UEFI or Legacy
+	//   ProcVirtualization   - Enabled/Disabled (Intel VT-x / AMD-V)
+	//   MemoryMode           - Optimizer/Mirror/Advanced ECC
+	//   SriovGlobalEnable    - SR-IOV support for NIC passthrough
+	//   SystemModelName      - Dell model string
+	// The full attribute set varies by iDRAC/BIOS version.
+	Attributes map[string]interface{} `json:"attributes"`
+
+	// PendingAttributes contains staged BIOS changes awaiting the next reboot,
+	// fetched from /redfish/v1/Systems/System.Embedded.1/Bios/Settings.
+	// Nil (omitted from JSON) when include_pending is false or no changes are staged.
+	PendingAttributes map[string]interface{} `json:"pending_attributes,omitempty"`
+}
+
 // -- discover_resources ------------------------------------------------------
 
 type DiscoverResourcesInput struct {
@@ -941,6 +970,82 @@ func (s *Server) handleGetAlertConfig(ctx context.Context, req *mcp.CallToolRequ
 
 	observeTool("get_alert_config", start, nil)
 	return nil, GetAlertConfigOutput{EventService: svcInfo, Subscriptions: subs}, nil
+}
+
+// handleGetBiosSettings retrieves BIOS attribute settings for compliance
+// auditing and configuration review.
+//
+// Dell iDRAC paths used:
+//
+//	Current attributes:  /redfish/v1/Systems/System.Embedded.1/Bios
+//	Pending (staged):    /redfish/v1/Systems/System.Embedded.1/Bios/Settings
+//
+// Pending attributes are only fetched when input.IncludePending is true.
+// A 404 on the /Bios/Settings resource is treated as "no pending changes"
+// rather than an error, since not all iDRAC firmware versions expose this path.
+func (s *Server) handleGetBiosSettings(ctx context.Context, req *mcp.CallToolRequest, input GetBiosSettingsInput) (*mcp.CallToolResult, GetBiosSettingsOutput, error) {
+	start := time.Now()
+	s.logger.Info("Handling get_bios_settings request")
+
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		err := fmt.Errorf("no server configured")
+		observeTool("get_bios_settings", start, err)
+		return nil, GetBiosSettingsOutput{}, err
+	}
+
+	// Fetch current BIOS attributes.
+	// Dell iDRAC path: /redfish/v1/Systems/System.Embedded.1/Bios
+	resp, err := s.fetchResource(serverAddr, "/redfish/v1/Systems/System.Embedded.1/Bios")
+	if err != nil {
+		observeTool("get_bios_settings", start, err)
+		return nil, GetBiosSettingsOutput{}, fmt.Errorf("failed to get BIOS settings: %w", err)
+	}
+
+	data, ok := resp.Data.(map[string]interface{})
+	if !ok {
+		err := fmt.Errorf("unexpected BIOS response format")
+		observeTool("get_bios_settings", start, err)
+		return nil, GetBiosSettingsOutput{}, err
+	}
+
+	// The Redfish BIOS schema wraps all settings under the "Attributes" key.
+	attrs, _ := data["Attributes"].(map[string]interface{})
+	if attrs == nil {
+		// Fallback: some iDRAC versions return attributes at the top level.
+		attrs = data
+	}
+
+	out := GetBiosSettingsOutput{
+		Attributes: attrs,
+	}
+
+	// Optionally fetch pending (staged) BIOS changes.
+	// Dell iDRAC path: /redfish/v1/Systems/System.Embedded.1/Bios/Settings
+	// These are changes that have been submitted but not yet applied; they take
+	// effect on the next system reboot.
+	if input.IncludePending {
+		pendingResp, err := s.fetchResource(serverAddr, "/redfish/v1/Systems/System.Embedded.1/Bios/Settings")
+		if err != nil {
+			// A 404 means the path is unsupported on this iDRAC version — not fatal.
+			if rfErr, ok := err.(*redfish.RedfishError); ok && rfErr.Code == 404 {
+				s.logger.Info("Bios/Settings path not found on this iDRAC — no pending changes", "server", serverAddr)
+			} else {
+				s.logger.Warn("Failed to fetch pending BIOS settings", "server", serverAddr, "error", err)
+			}
+		} else if pendingData, ok := pendingResp.Data.(map[string]interface{}); ok {
+			pendingAttrs, _ := pendingData["Attributes"].(map[string]interface{})
+			if pendingAttrs == nil {
+				pendingAttrs = pendingData
+			}
+			if len(pendingAttrs) > 0 {
+				out.PendingAttributes = pendingAttrs
+			}
+		}
+	}
+
+	observeTool("get_bios_settings", start, nil)
+	return nil, out, nil
 }
 
 func (s *Server) handleDiscoverResources(ctx context.Context, req *mcp.CallToolRequest, input DiscoverResourcesInput) (*mcp.CallToolResult, DiscoverResourcesOutput, error) {

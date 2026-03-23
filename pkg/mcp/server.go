@@ -152,10 +152,22 @@ func (s *Server) registerTools() error {
 		Description: "Show current alert/notification configuration: EventService enabled status and delivery retry policy, plus all subscriptions (destination, protocol, event types, severity filter, context, state). Read-only. Dell iDRAC paths: /redfish/v1/EventService and /redfish/v1/EventService/Subscriptions.",
 	}, s.handleGetAlertConfig)
 
+	// Register get_virtual_media tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_virtual_media",
+		Description: "Check virtual media mount status — what ISOs or images are currently mounted on the BMC. Returns each slot's ID, name, media type (CD/DVD/Floppy/USBStick), inserted status, image URI, connected status, and write-protected flag. Useful for PXE/provisioning workflows to confirm a boot ISO is mounted before initiating a one-shot boot. Dell iDRAC path: /redfish/v1/Managers/iDRAC.Embedded.1/VirtualMedia (Manager ID is Dell-specific).",
+	}, s.handleGetVirtualMedia)
+
+	// Register get_bios_settings tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_bios_settings",
+		Description: "Retrieve current BIOS attribute settings for compliance auditing and configuration review. Returns all BIOS attributes (BootMode, ProcVirtualization, MemoryMode, SriovGlobalEnable, SystemModelName, etc.). Optionally includes pending BIOS changes that are staged but not yet applied (require a reboot). Dell iDRAC paths: /redfish/v1/Systems/System.Embedded.1/Bios (current) and /redfish/v1/Systems/System.Embedded.1/Bios/Settings (pending).",
+	}, s.handleGetBiosSettings)
+
 	// Register write/mutation tools (gated by REDFISH_READ_ONLY)
 	s.registerWriteTools()
 
-	s.logger.Info("MCP tools registered successfully", "count", 16)
+	s.logger.Info("MCP tools registered successfully", "count", 19)
 	return nil
 }
 

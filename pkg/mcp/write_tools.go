@@ -113,6 +113,21 @@ type ClearEventLogOutput struct {
 	Data       interface{} `json:"data,omitempty"`
 }
 
+// SetBiosSettingInput represents input for the set_bios_setting tool.
+type SetBiosSettingInput struct {
+	Host      string `json:"host" jsonschema:"BMC hostname from server config (required)"`
+	Attribute string `json:"attribute" jsonschema:"BIOS attribute name to change, e.g. 'ProcVirtualization' (required)"`
+	Value     string `json:"value" jsonschema:"New value for the BIOS attribute, e.g. 'Enabled' (required)"`
+}
+
+// SetBiosSettingOutput represents the result of staging a BIOS attribute change.
+type SetBiosSettingOutput struct {
+	StatusCode int         `json:"status_code,omitempty"`
+	Message    string      `json:"message"`
+	Warning    string      `json:"warning"`
+	Data       interface{} `json:"data,omitempty"`
+}
+
 // SetAlertConfigInput represents input for the set_alert_config tool.
 type SetAlertConfigInput struct {
 	Host           string   `json:"host" jsonschema:"BMC hostname from server config (required)"`
@@ -187,6 +202,11 @@ func (s *Server) registerWriteTools() {
 		Name:        "set_alert_config",
 		Description: "[WRITE] Manage iDRAC alert destinations and filtering via EventService subscriptions (requires REDFISH_READ_ONLY=false). Actions: list (show current subscriptions), add (create new with destination URL, protocol, event type and severity filters), remove (delete by ID), update (patch existing). Supports protocols: SNMPv1, SNMPv2c, SNMPv3, Syslog, Redfish, SMTP.",
 	}, s.handleSetAlertConfig)
+
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "set_bios_setting",
+		Description: "[WRITE] Stage a BIOS attribute change on the server (requires REDFISH_READ_ONLY=false). Changes are staged and will only take effect after the next reboot — use power_action with GracefulRestart to apply. Does NOT auto-reboot. Example attributes: ProcVirtualization, BootMode, SysProfile.",
+	}, s.handleSetBiosSetting)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +596,75 @@ func (s *Server) handleAlertRemove(serverAddr string, input SetAlertConfigInput)
 	return nil, SetAlertConfigOutput{
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("Alert subscription %s removed successfully", input.SubscriptionID),
+		Data:       response.Data,
+	}, nil
+}
+
+// handleSetBiosSetting stages a BIOS attribute change via the Redfish Bios/Settings
+// pending-change resource. The change is not applied until the next system reboot.
+//
+// NOTE: /redfish/v1/Systems/System.Embedded.1/Bios/Settings is the Dell iDRAC-specific
+// path for staging BIOS attribute changes. The parent resource
+// /redfish/v1/Systems/System.Embedded.1/Bios reflects the currently active values;
+// /Bios/Settings holds the pending (not-yet-applied) changes. This two-resource
+// pattern is standard Redfish DSP0268 but the Systems member identifier
+// ("System.Embedded.1") is Dell-specific and may differ on other BMC implementations.
+func (s *Server) handleSetBiosSetting(ctx context.Context, req *mcp.CallToolRequest, input SetBiosSettingInput) (*mcp.CallToolResult, SetBiosSettingOutput, error) {
+	// Safety gate
+	if err := s.checkReadOnly("BIOS settings"); err != nil {
+		return nil, SetBiosSettingOutput{}, err
+	}
+
+	// Validate required inputs
+	if input.Attribute == "" {
+		return nil, SetBiosSettingOutput{}, fmt.Errorf("attribute is required")
+	}
+	if input.Value == "" {
+		return nil, SetBiosSettingOutput{}, fmt.Errorf("value is required")
+	}
+
+	// Resolve server address — use provided host or fall back to first configured server.
+	var serverAddr string
+	if input.Host != "" {
+		serverAddr = input.Host
+	} else {
+		addrs := s.hostManager.GetAddresses()
+		if len(addrs) == 0 {
+			return nil, SetBiosSettingOutput{}, fmt.Errorf("no servers configured")
+		}
+		serverAddr = addrs[0]
+	}
+
+	// Rate limit + serialize writes per server
+	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
+	if err != nil {
+		return nil, SetBiosSettingOutput{}, err
+	}
+	defer release()
+
+	s.logger.Warn("Staging BIOS attribute change", "server", serverAddr, "attribute", input.Attribute, "value", input.Value)
+
+	body := map[string]interface{}{
+		"Attributes": map[string]interface{}{
+			input.Attribute: input.Value,
+		},
+	}
+
+	// NOTE: PATCH to /Bios/Settings stages the change in the pending-values resource.
+	// The change does not take effect until the next system reboot. Dell iDRAC returns
+	// 200 OK on success; the updated pending value can be confirmed by GET /Bios/Settings.
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.Patch("/redfish/v1/Systems/System.Embedded.1/Bios/Settings", body)
+	})
+	if err != nil {
+		return nil, SetBiosSettingOutput{}, fmt.Errorf("failed to stage BIOS setting: %w", err)
+	}
+	recordSuccess()
+
+	return nil, SetBiosSettingOutput{
+		StatusCode: response.StatusCode,
+		Message:    fmt.Sprintf("BIOS attribute '%s' staged to '%s' on %s", input.Attribute, input.Value, serverAddr),
+		Warning:    "Change is staged only — a system reboot is required for the new value to take effect. Use power_action with GracefulRestart to apply.",
 		Data:       response.Data,
 	}, nil
 }
