@@ -118,6 +118,7 @@ func loadRedfishConfig() (*RedfishConfig, error) {
 		Password:           getEnv("REDFISH_PASSWORD", ""),
 		TLSServerCACert:    getEnv("REDFISH_SERVER_CA_CERT", ""),
 		InsecureSkipVerify: getEnvBool("REDFISH_INSECURE_SKIP_VERIFY", false),
+		ReadOnly:           getEnvBool("REDFISH_READ_ONLY", true), // Default TRUE — write tools blocked unless explicitly disabled
 		DiscoveryEnabled:   getEnvBool("REDFISH_DISCOVERY_ENABLED", false),
 		DiscoveryInterval:  discoveryInterval,
 	}

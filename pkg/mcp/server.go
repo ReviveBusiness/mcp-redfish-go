@@ -90,6 +90,9 @@ func (s *Server) registerTools() error {
 		Description: "Fetch data from a specific Redfish resource",
 	}, s.handleGetResourceData)
 
+	// Register write/mutation tools (gated by REDFISH_READ_ONLY)
+	s.registerWriteTools()
+
 	s.logger.Info("MCP tools registered successfully")
 	return nil
 }

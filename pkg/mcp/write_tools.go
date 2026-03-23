@@ -1,0 +1,241 @@
+package mcp
+
+import (
+	"context"
+	"fmt"
+	"slices"
+
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/redfish"
+)
+
+// ---------------------------------------------------------------------------
+// Input / Output structs
+// ---------------------------------------------------------------------------
+
+// PowerActionInput represents input for the power_action tool.
+type PowerActionInput struct {
+	ResetType string `json:"reset_type" jsonschema:"Reset type: On, ForceOff, ForceRestart, GracefulRestart, GracefulShutdown, PushPowerButton, Nmi, PowerCycle"`
+}
+
+// PowerActionOutput represents the result of a power action.
+type PowerActionOutput struct {
+	StatusCode int         `json:"status_code"`
+	Message    string      `json:"message"`
+	Data       interface{} `json:"data,omitempty"`
+}
+
+// SetBootOverrideInput represents input for the set_boot_override tool.
+type SetBootOverrideInput struct {
+	Target  string `json:"target" jsonschema:"Boot target: None, Pxe, Cd, Hdd, BiosSetup, Utilities, UefiTarget, SDCard, UefiHttp"`
+	Enabled string `json:"enabled" jsonschema:"Override mode: Once, Continuous, Disabled"`
+}
+
+// SetBootOverrideOutput represents the result of a boot override change.
+type SetBootOverrideOutput struct {
+	StatusCode int         `json:"status_code"`
+	Message    string      `json:"message"`
+	Data       interface{} `json:"data,omitempty"`
+}
+
+// ClearEventLogInput is an empty struct — the tool takes no parameters.
+type ClearEventLogInput struct{}
+
+// ClearEventLogOutput represents the result of clearing the event log.
+type ClearEventLogOutput struct {
+	StatusCode int         `json:"status_code"`
+	Message    string      `json:"message"`
+	Data       interface{} `json:"data,omitempty"`
+}
+
+// ---------------------------------------------------------------------------
+// Allowed values
+// ---------------------------------------------------------------------------
+
+var validResetTypes = []string{
+	"On", "ForceOff", "ForceRestart", "GracefulRestart",
+	"GracefulShutdown", "PushPowerButton", "Nmi", "PowerCycle",
+}
+
+var validBootTargets = []string{
+	"None", "Pxe", "Cd", "Hdd", "BiosSetup",
+	"Utilities", "UefiTarget", "SDCard", "UefiHttp",
+}
+
+var validBootEnabled = []string{
+	"Once", "Continuous", "Disabled",
+}
+
+// ---------------------------------------------------------------------------
+// Registration (called from registerTools in server.go)
+// ---------------------------------------------------------------------------
+
+// registerWriteTools registers all write/mutation MCP tools.
+func (s *Server) registerWriteTools() {
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "power_action",
+		Description: "[WRITE] Execute a power action on the server (requires REDFISH_READ_ONLY=false). Supports: On, ForceOff, ForceRestart, GracefulRestart, GracefulShutdown, PushPowerButton, Nmi, PowerCycle",
+	}, s.handlePowerAction)
+
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "set_boot_override",
+		Description: "[WRITE] Set one-time or persistent boot source override (requires REDFISH_READ_ONLY=false). Use with power_action GracefulRestart to boot from the override target.",
+	}, s.handleSetBootOverride)
+
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "clear_event_log",
+		Description: "[WRITE] Clear the iDRAC System Event Log (requires REDFISH_READ_ONLY=false). Use after investigating and resolving hardware events.",
+	}, s.handleClearEventLog)
+}
+
+// ---------------------------------------------------------------------------
+// Safety gate
+// ---------------------------------------------------------------------------
+
+// checkReadOnly returns an error when REDFISH_READ_ONLY is true (the default).
+func (s *Server) checkReadOnly(operation string) error {
+	if s.config.Redfish.ReadOnly {
+		return fmt.Errorf("write operations disabled: REDFISH_READ_ONLY=true (default). Set REDFISH_READ_ONLY=false to enable %s", operation)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// 401-retry helper
+// ---------------------------------------------------------------------------
+
+// withRetryOn401 executes fn with client. On a 401 RedfishError it refreshes
+// the session via getClient and retries fn exactly once.
+func (s *Server) withRetryOn401(serverAddr string, fn func(c *redfish.Client) (*redfish.RedfishResponse, error)) (*redfish.RedfishResponse, error) {
+	client, err := s.getClient(serverAddr, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	response, err := fn(client)
+	if err != nil {
+		if rfErr, ok := err.(*redfish.RedfishError); ok && rfErr.Code == 401 {
+			s.logger.Warn("Session expired, re-authenticating", "server", serverAddr)
+			client, err = s.getClient(serverAddr, client)
+			if err != nil {
+				return nil, fmt.Errorf("re-login failed: %w", err)
+			}
+			response, err = fn(client)
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return response, nil
+}
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
+
+// handlePowerAction executes a ComputerSystem.Reset action on the first
+// configured server.
+func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest, input PowerActionInput) (*mcp.CallToolResult, PowerActionOutput, error) {
+	// Safety gate
+	if err := s.checkReadOnly("power actions"); err != nil {
+		return nil, PowerActionOutput{}, err
+	}
+
+	// Validate input
+	if !slices.Contains(validResetTypes, input.ResetType) {
+		return nil, PowerActionOutput{}, fmt.Errorf("invalid reset type: %s. Must be one of: %v", input.ResetType, validResetTypes)
+	}
+
+	serverAddr := s.hostManager.GetAddresses()[0]
+
+	// Log at Warn — all write operations are auditable.
+	s.logger.Warn("Executing power action", "server", serverAddr, "reset_type", input.ResetType)
+
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.PostJSON(
+			"/redfish/v1/Systems/System.Embedded.1/Actions/ComputerSystem.Reset",
+			map[string]string{"ResetType": input.ResetType},
+		)
+	})
+	if err != nil {
+		return nil, PowerActionOutput{}, fmt.Errorf("power action failed: %w", err)
+	}
+
+	return nil, PowerActionOutput{
+		StatusCode: response.StatusCode,
+		Message:    fmt.Sprintf("Power action %s executed successfully", input.ResetType),
+		Data:       response.Data,
+	}, nil
+}
+
+// handleSetBootOverride patches the Boot source override on the first
+// configured server.
+func (s *Server) handleSetBootOverride(ctx context.Context, req *mcp.CallToolRequest, input SetBootOverrideInput) (*mcp.CallToolResult, SetBootOverrideOutput, error) {
+	// Safety gate
+	if err := s.checkReadOnly("boot override"); err != nil {
+		return nil, SetBootOverrideOutput{}, err
+	}
+
+	// Validate inputs
+	if !slices.Contains(validBootTargets, input.Target) {
+		return nil, SetBootOverrideOutput{}, fmt.Errorf("invalid boot target: %s. Must be one of: %v", input.Target, validBootTargets)
+	}
+	if !slices.Contains(validBootEnabled, input.Enabled) {
+		return nil, SetBootOverrideOutput{}, fmt.Errorf("invalid boot override mode: %s. Must be one of: %v", input.Enabled, validBootEnabled)
+	}
+
+	serverAddr := s.hostManager.GetAddresses()[0]
+
+	s.logger.Warn("Setting boot override", "server", serverAddr, "target", input.Target, "enabled", input.Enabled)
+
+	body := map[string]interface{}{
+		"Boot": map[string]string{
+			"BootSourceOverrideTarget":  input.Target,
+			"BootSourceOverrideEnabled": input.Enabled,
+		},
+	}
+
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.PatchJSON("/redfish/v1/Systems/System.Embedded.1", body)
+	})
+	if err != nil {
+		return nil, SetBootOverrideOutput{}, fmt.Errorf("set boot override failed: %w", err)
+	}
+
+	return nil, SetBootOverrideOutput{
+		StatusCode: response.StatusCode,
+		Message:    fmt.Sprintf("Boot override set to %s (%s)", input.Target, input.Enabled),
+		Data:       response.Data,
+	}, nil
+}
+
+// handleClearEventLog clears the iDRAC System Event Log on the first
+// configured server.
+func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolRequest, input ClearEventLogInput) (*mcp.CallToolResult, ClearEventLogOutput, error) {
+	// Safety gate
+	if err := s.checkReadOnly("event log clearing"); err != nil {
+		return nil, ClearEventLogOutput{}, err
+	}
+
+	serverAddr := s.hostManager.GetAddresses()[0]
+
+	s.logger.Warn("Clearing iDRAC System Event Log", "server", serverAddr)
+
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.PostJSON(
+			"/redfish/v1/Managers/iDRAC.Embedded.1/LogServices/Sel/Actions/LogService.ClearLog",
+			map[string]string{},
+		)
+	})
+	if err != nil {
+		return nil, ClearEventLogOutput{}, fmt.Errorf("clear event log failed: %w", err)
+	}
+
+	return nil, ClearEventLogOutput{
+		StatusCode: response.StatusCode,
+		Message:    "iDRAC System Event Log cleared successfully",
+		Data:       response.Data,
+	}, nil
+}

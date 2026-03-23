@@ -61,6 +61,7 @@ type RedfishConfig struct {
 	Password           string       `json:"password"`
 	TLSServerCACert    string       `json:"tls_server_ca_cert,omitempty"`
 	InsecureSkipVerify bool         `json:"insecure_skip_verify"`
+	ReadOnly           bool         `json:"read_only"`
 	DiscoveryEnabled   bool         `json:"discovery_enabled"`
 	DiscoveryInterval  int          `json:"discovery_interval"`
 }
