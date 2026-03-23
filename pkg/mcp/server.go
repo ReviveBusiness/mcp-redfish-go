@@ -149,7 +149,7 @@ func (s *Server) registerTools() error {
 	// Register write/mutation tools (gated by REDFISH_READ_ONLY)
 	s.registerWriteTools()
 
-	s.logger.Info("MCP tools registered successfully", "count", 14)
+	s.logger.Info("MCP tools registered successfully", "count", 15)
 	return nil
 }
 

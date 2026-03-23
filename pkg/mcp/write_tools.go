@@ -113,6 +113,25 @@ type ClearEventLogOutput struct {
 	Data       interface{} `json:"data,omitempty"`
 }
 
+// SetAlertConfigInput represents input for the set_alert_config tool.
+type SetAlertConfigInput struct {
+	Host           string   `json:"host" jsonschema:"BMC hostname from server config (required)"`
+	Action         string   `json:"action" jsonschema:"Action to perform: list|add|remove|update"`
+	SubscriptionID string   `json:"subscription_id,omitempty" jsonschema:"Subscription ID, required for remove/update (e.g. 'SubscriptionId1')"`
+	Destination    string   `json:"destination,omitempty" jsonschema:"Target URL, required for add (e.g. 'snmp://10.0.0.1:162' or 'syslog://10.0.0.2:514')"`
+	Protocol       string   `json:"protocol,omitempty" jsonschema:"Alert protocol, required for add: SNMPv1|SNMPv2c|SNMPv3|Syslog|Redfish|SMTP"`
+	EventTypes     []string `json:"event_types,omitempty" jsonschema:"Event type filter: Alert, StatusChange, ResourceUpdated, ResourceAdded, ResourceRemoved"`
+	Severity       []string `json:"severity,omitempty" jsonschema:"Severity filter: OK, Warning, Critical"`
+	Context        string   `json:"context,omitempty" jsonschema:"Human-readable description of this subscription"`
+}
+
+// SetAlertConfigOutput represents the result of an alert configuration operation.
+type SetAlertConfigOutput struct {
+	StatusCode int         `json:"status_code,omitempty"`
+	Message    string      `json:"message"`
+	Data       interface{} `json:"data,omitempty"`
+}
+
 // ---------------------------------------------------------------------------
 // Allowed values
 // ---------------------------------------------------------------------------
@@ -130,6 +149,18 @@ var validBootTargets = []string{
 var validBootEnabled = []string{
 	"Once", "Continuous", "Disabled",
 }
+
+var validAlertActions = []string{"list", "add", "remove", "update"}
+
+var validAlertProtocols = []string{
+	"SNMPv1", "SNMPv2c", "SNMPv3", "Syslog", "Redfish", "SMTP",
+}
+
+var validEventTypes = []string{
+	"Alert", "StatusChange", "ResourceUpdated", "ResourceAdded", "ResourceRemoved",
+}
+
+var validSeverities = []string{"OK", "Warning", "Critical"}
 
 // ---------------------------------------------------------------------------
 // Registration (called from registerTools in server.go)
@@ -151,6 +182,11 @@ func (s *Server) registerWriteTools() {
 		Name:        "clear_event_log",
 		Description: "[WRITE] Clear the iDRAC System Event Log (requires REDFISH_READ_ONLY=false). Use after investigating and resolving hardware events.",
 	}, s.handleClearEventLog)
+
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "set_alert_config",
+		Description: "[WRITE] Manage iDRAC alert destinations and filtering via EventService subscriptions (requires REDFISH_READ_ONLY=false). Actions: list (show current subscriptions), add (create new with destination URL, protocol, event type and severity filters), remove (delete by ID), update (patch existing). Supports protocols: SNMPv1, SNMPv2c, SNMPv3, Syslog, Redfish, SMTP.",
+	}, s.handleSetAlertConfig)
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +407,249 @@ func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolReque
 	return nil, ClearEventLogOutput{
 		StatusCode: response.StatusCode,
 		Message:    "iDRAC System Event Log cleared successfully",
+		Data:       response.Data,
+	}, nil
+}
+
+// handleSetAlertConfig manages iDRAC alert destinations and filtering via the
+// Redfish EventService. Supports list/add/remove/update of subscriptions.
+//
+// NOTE: The EventService paths below are standard Redfish paths, but Dell iDRAC
+// may return additional OEM fields in subscription responses. Specifically:
+//   - /redfish/v1/EventService — service root with SMTP and SNMP settings
+//   - /redfish/v1/EventService/Subscriptions — subscription collection
+//   - /redfish/v1/EventService/Subscriptions/{id} — individual subscription
+//
+// These paths are consistent across iDRAC 8/9 firmware releases.
+func (s *Server) handleSetAlertConfig(ctx context.Context, req *mcp.CallToolRequest, input SetAlertConfigInput) (*mcp.CallToolResult, SetAlertConfigOutput, error) {
+	// Safety gate — list is read-only; all other actions require write access.
+	if input.Action != "list" {
+		if err := s.checkReadOnly("alert configuration"); err != nil {
+			return nil, SetAlertConfigOutput{}, err
+		}
+	}
+
+	// Validate action
+	if !slices.Contains(validAlertActions, input.Action) {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid action: %s. Must be one of: %v", input.Action, validAlertActions)
+	}
+
+	// Resolve server address — use provided host or fall back to first configured server.
+	var serverAddr string
+	if input.Host != "" {
+		serverAddr = input.Host
+	} else {
+		addrs := s.hostManager.GetAddresses()
+		if len(addrs) == 0 {
+			return nil, SetAlertConfigOutput{}, fmt.Errorf("no servers configured")
+		}
+		serverAddr = addrs[0]
+	}
+
+	switch input.Action {
+	case "list":
+		return s.handleAlertList(serverAddr)
+	case "add":
+		return s.handleAlertAdd(serverAddr, input)
+	case "remove":
+		return s.handleAlertRemove(serverAddr, input)
+	case "update":
+		return s.handleAlertUpdate(serverAddr, input)
+	}
+
+	// Unreachable — all cases handled above after validation.
+	return nil, SetAlertConfigOutput{}, fmt.Errorf("unhandled action: %s", input.Action)
+}
+
+// handleAlertList fetches the EventService subscriptions collection.
+func (s *Server) handleAlertList(serverAddr string) (*mcp.CallToolResult, SetAlertConfigOutput, error) {
+	// NOTE: /redfish/v1/EventService/Subscriptions is the standard Redfish path
+	// for the alert subscription collection. Dell iDRAC uses this path verbatim.
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.Get("/redfish/v1/EventService/Subscriptions")
+	})
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("failed to list alert subscriptions: %w", err)
+	}
+
+	return nil, SetAlertConfigOutput{
+		StatusCode: response.StatusCode,
+		Message:    "Alert subscriptions retrieved successfully",
+		Data:       response.Data,
+	}, nil
+}
+
+// handleAlertAdd creates a new EventService subscription.
+func (s *Server) handleAlertAdd(serverAddr string, input SetAlertConfigInput) (*mcp.CallToolResult, SetAlertConfigOutput, error) {
+	// Validate required fields for add
+	if input.Destination == "" {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("destination is required for action=add")
+	}
+	if input.Protocol == "" {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("protocol is required for action=add")
+	}
+	if !slices.Contains(validAlertProtocols, input.Protocol) {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid protocol: %s. Must be one of: %v", input.Protocol, validAlertProtocols)
+	}
+
+	// Validate optional event type filter
+	for _, et := range input.EventTypes {
+		if !slices.Contains(validEventTypes, et) {
+			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid event type: %s. Must be one of: %v", et, validEventTypes)
+		}
+	}
+
+	// Validate optional severity filter
+	for _, sev := range input.Severity {
+		if !slices.Contains(validSeverities, sev) {
+			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid severity: %s. Must be one of: %v", sev, validSeverities)
+		}
+	}
+
+	// Rate limit + serialize writes per server
+	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, err
+	}
+	defer release()
+
+	// Build subscription body
+	body := map[string]interface{}{
+		"Destination": input.Destination,
+		"Protocol":    input.Protocol,
+	}
+	if len(input.EventTypes) > 0 {
+		body["EventTypes"] = input.EventTypes
+	}
+	if len(input.Severity) > 0 {
+		body["MessageSeverity"] = input.Severity
+	}
+	if input.Context != "" {
+		body["Context"] = input.Context
+	}
+
+	s.logger.Warn("Adding alert subscription", "server", serverAddr, "destination", input.Destination, "protocol", input.Protocol)
+
+	// NOTE: POST to /redfish/v1/EventService/Subscriptions creates a new subscription.
+	// Dell iDRAC returns 201 Created with the new subscription URL in the Location header.
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.Post("/redfish/v1/EventService/Subscriptions", body)
+	})
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("failed to add alert subscription: %w", err)
+	}
+	recordSuccess()
+
+	return nil, SetAlertConfigOutput{
+		StatusCode: response.StatusCode,
+		Message:    fmt.Sprintf("Alert subscription added for %s (protocol: %s)", input.Destination, input.Protocol),
+		Data:       response.Data,
+	}, nil
+}
+
+// handleAlertRemove deletes an EventService subscription by ID.
+func (s *Server) handleAlertRemove(serverAddr string, input SetAlertConfigInput) (*mcp.CallToolResult, SetAlertConfigOutput, error) {
+	if input.SubscriptionID == "" {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("subscription_id is required for action=remove")
+	}
+
+	// Rate limit + serialize writes per server
+	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, err
+	}
+	defer release()
+
+	s.logger.Warn("Removing alert subscription", "server", serverAddr, "subscription_id", input.SubscriptionID)
+
+	// NOTE: DELETE /redfish/v1/EventService/Subscriptions/{id} removes the subscription.
+	// Dell iDRAC returns 200 OK on successful deletion.
+	path := fmt.Sprintf("/redfish/v1/EventService/Subscriptions/%s", input.SubscriptionID)
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.Delete(path)
+	})
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("failed to remove alert subscription %s: %w", input.SubscriptionID, err)
+	}
+	recordSuccess()
+
+	return nil, SetAlertConfigOutput{
+		StatusCode: response.StatusCode,
+		Message:    fmt.Sprintf("Alert subscription %s removed successfully", input.SubscriptionID),
+		Data:       response.Data,
+	}, nil
+}
+
+// handleAlertUpdate patches an existing EventService subscription.
+func (s *Server) handleAlertUpdate(serverAddr string, input SetAlertConfigInput) (*mcp.CallToolResult, SetAlertConfigOutput, error) {
+	if input.SubscriptionID == "" {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("subscription_id is required for action=update")
+	}
+
+	// Validate optional protocol
+	if input.Protocol != "" && !slices.Contains(validAlertProtocols, input.Protocol) {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid protocol: %s. Must be one of: %v", input.Protocol, validAlertProtocols)
+	}
+
+	// Validate optional event type filter
+	for _, et := range input.EventTypes {
+		if !slices.Contains(validEventTypes, et) {
+			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid event type: %s. Must be one of: %v", et, validEventTypes)
+		}
+	}
+
+	// Validate optional severity filter
+	for _, sev := range input.Severity {
+		if !slices.Contains(validSeverities, sev) {
+			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid severity: %s. Must be one of: %v", sev, validSeverities)
+		}
+	}
+
+	// Build patch body — only include fields that were provided.
+	body := map[string]interface{}{}
+	if input.Destination != "" {
+		body["Destination"] = input.Destination
+	}
+	if input.Protocol != "" {
+		body["Protocol"] = input.Protocol
+	}
+	if len(input.EventTypes) > 0 {
+		body["EventTypes"] = input.EventTypes
+	}
+	if len(input.Severity) > 0 {
+		body["MessageSeverity"] = input.Severity
+	}
+	if input.Context != "" {
+		body["Context"] = input.Context
+	}
+
+	if len(body) == 0 {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("no fields provided for update — supply at least one of: destination, protocol, event_types, severity, context")
+	}
+
+	// Rate limit + serialize writes per server
+	release, recordSuccess, err := limiter.acquireWrite(serverAddr)
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, err
+	}
+	defer release()
+
+	s.logger.Warn("Updating alert subscription", "server", serverAddr, "subscription_id", input.SubscriptionID)
+
+	// NOTE: PATCH /redfish/v1/EventService/Subscriptions/{id} modifies an existing
+	// subscription. Dell iDRAC returns 200 OK with the updated subscription body.
+	path := fmt.Sprintf("/redfish/v1/EventService/Subscriptions/%s", input.SubscriptionID)
+	response, err := s.withRetryOn401(serverAddr, func(c *redfish.Client) (*redfish.RedfishResponse, error) {
+		return c.Patch(path, body)
+	})
+	if err != nil {
+		return nil, SetAlertConfigOutput{}, fmt.Errorf("failed to update alert subscription %s: %w", input.SubscriptionID, err)
+	}
+	recordSuccess()
+
+	return nil, SetAlertConfigOutput{
+		StatusCode: response.StatusCode,
+		Message:    fmt.Sprintf("Alert subscription %s updated successfully", input.SubscriptionID),
 		Data:       response.Data,
 	}, nil
 }
