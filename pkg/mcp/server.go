@@ -163,7 +163,7 @@ func (s *Server) getClient(serverAddr string, staleClient *redfish.Client) (*red
 	// If another goroutine raced us here and already stored a fresh client,
 	// prefer theirs and discard ours to avoid leaking a duplicate session.
 	s.mu.Lock()
-	if current, ok := s.clients[serverAddr]; ok && staleClient != nil && current != staleClient {
+	if current, ok := s.clients[serverAddr]; ok && current != staleClient {
 		s.mu.Unlock()
 		// Another goroutine won the race — close the client we just created.
 		if err := newClient.Close(); err != nil {
@@ -324,6 +324,8 @@ func (s *Server) Start(ctx context.Context) error {
 		return s.startStdio(ctx)
 	case config.MCPTransportSSE:
 		return s.startSSE(ctx)
+	case config.MCPTransportStreamableHTTP:
+		return fmt.Errorf("streamable-http transport not yet implemented (planned for next release)")
 	default:
 		return fmt.Errorf("unsupported transport: %s", s.config.MCP.Transport)
 	}

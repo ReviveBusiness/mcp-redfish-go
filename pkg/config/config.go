@@ -107,7 +107,12 @@ func (m *MCPConfig) Validate() error {
 		return fmt.Errorf("invalid log_level: %s. Must be one of: %v", m.LogLevel, validLogLevels)
 	}
 
-	if m.Port != 0 && (m.Port < 1 || m.Port > 65535) {
+	// Non-stdio transports require a valid listen port.
+	if m.Transport != MCPTransportStdio {
+		if m.Port < 1 || m.Port > 65535 {
+			return fmt.Errorf("port must be between 1 and 65535 for %s transport, got: %d", m.Transport, m.Port)
+		}
+	} else if m.Port != 0 && (m.Port < 1 || m.Port > 65535) {
 		return fmt.Errorf("port must be between 1 and 65535, got: %d", m.Port)
 	}
 

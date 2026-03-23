@@ -59,6 +59,7 @@ func main() {
 	logger.Info("Starting Redfish MCP server")
 	if err := server.Start(ctx); err != nil {
 		logger.Error("Server failed to start", "error", err)
+		server.Close() // os.Exit skips defers — close sessions explicitly
 		os.Exit(1)
 	}
 
