@@ -304,6 +304,40 @@ type GetFirmwareInventoryOutput struct {
 	Components []FirmwareComponent `json:"components"`
 }
 
+// -- get_alert_config --------------------------------------------------------
+
+type GetAlertConfigInput struct {
+	ServerAddressInput
+}
+
+// EventServiceInfo holds top-level EventService status from /redfish/v1/EventService.
+// Dell iDRAC path: /redfish/v1/EventService
+type EventServiceInfo struct {
+	ServiceEnabled          bool     `json:"service_enabled"`
+	DeliveryRetryAttempts   float64  `json:"delivery_retry_attempts"`
+	DeliveryRetryIntervalSeconds float64 `json:"delivery_retry_interval_seconds"`
+	EventTypesForSubscription []string `json:"event_types_for_subscription,omitempty"`
+}
+
+// AlertSubscription holds per-subscription data from /redfish/v1/EventService/Subscriptions/<id>.
+// Dell iDRAC path: /redfish/v1/EventService/Subscriptions
+type AlertSubscription struct {
+	Id          string   `json:"id"`
+	Destination string   `json:"destination"`
+	Protocol    string   `json:"protocol"`
+	Context     string   `json:"context"`
+	EventTypes  []string `json:"event_types,omitempty"`
+	// MessageSeverity is the Dell iDRAC filter field (Critical/Warning/OK).
+	// Standard Redfish uses RegistryPrefixes or ResourceTypes instead.
+	MessageSeverity string `json:"message_severity,omitempty"`
+	State           string `json:"state"`
+}
+
+type GetAlertConfigOutput struct {
+	EventService  EventServiceInfo    `json:"event_service"`
+	Subscriptions []AlertSubscription `json:"subscriptions"`
+}
+
 // -- discover_resources ------------------------------------------------------
 
 type DiscoverResourcesInput struct {
@@ -317,6 +351,45 @@ type ResourceLink struct {
 
 type DiscoverResourcesOutput struct {
 	Links []ResourceLink `json:"links"`
+}
+
+// -- get_virtual_media -------------------------------------------------------
+
+type GetVirtualMediaInput struct {
+	ServerAddressInput
+}
+
+// VirtualMediaSlot represents a single virtual media slot on the BMC.
+// MediaTypes values follow the Redfish VirtualMedia schema: CD, DVD, Floppy,
+// USBStick.
+//
+// Dell iDRAC-specific note: virtual media slots are accessed via the Manager
+// resource at /redfish/v1/Managers/iDRAC.Embedded.1/VirtualMedia.  The
+// Manager ID "iDRAC.Embedded.1" is Dell-specific; other vendors use different
+// identifiers (e.g. "BMC" on HPE iLO).
+type VirtualMediaSlot struct {
+	// Id is the slot identifier extracted from the resource path (e.g. "CD",
+	// "RemovableDisk").
+	Id string `json:"id"`
+	// Name is the human-readable label for this virtual media slot.
+	Name string `json:"name"`
+	// MediaTypes lists the media type(s) supported by this slot.
+	// Possible values per Redfish spec: CD, DVD, Floppy, USBStick.
+	MediaTypes []string `json:"media_types"`
+	// Inserted indicates whether a virtual disc image is currently inserted.
+	Inserted bool `json:"inserted"`
+	// Image is the URI or filename of the mounted image.
+	// Empty string when no image is mounted.
+	Image string `json:"image,omitempty"`
+	// Connected indicates whether the virtual media is actively connected to
+	// the host system (i.e. visible as a device to the OS).
+	Connected bool `json:"connected"`
+	// WriteProtected indicates whether the mounted image is write-protected.
+	WriteProtected bool `json:"write_protected"`
+}
+
+type GetVirtualMediaOutput struct {
+	Slots []VirtualMediaSlot `json:"slots"`
 }
 
 // ---------------------------------------------------------------------------
@@ -786,6 +859,90 @@ func (s *Server) handleGetFirmwareInventory(ctx context.Context, req *mcp.CallTo
 	return nil, GetFirmwareInventoryOutput{Components: components}, nil
 }
 
+func (s *Server) handleGetAlertConfig(ctx context.Context, req *mcp.CallToolRequest, input GetAlertConfigInput) (*mcp.CallToolResult, GetAlertConfigOutput, error) {
+	start := time.Now()
+	s.logger.Info("Handling get_alert_config request")
+
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		err := fmt.Errorf("no server configured")
+		observeTool("get_alert_config", start, err)
+		return nil, GetAlertConfigOutput{}, err
+	}
+
+	// Fetch EventService root — Dell iDRAC path: /redfish/v1/EventService
+	svcResp, err := s.fetchResource(serverAddr, "/redfish/v1/EventService")
+	if err != nil {
+		observeTool("get_alert_config", start, err)
+		return nil, GetAlertConfigOutput{}, fmt.Errorf("failed to get EventService: %w", err)
+	}
+
+	svcData, ok := svcResp.Data.(map[string]interface{})
+	if !ok {
+		err := fmt.Errorf("unexpected EventService response format")
+		observeTool("get_alert_config", start, err)
+		return nil, GetAlertConfigOutput{}, err
+	}
+
+	serviceEnabled, _ := svcData["ServiceEnabled"].(bool)
+	svcInfo := EventServiceInfo{
+		ServiceEnabled:               serviceEnabled,
+		DeliveryRetryAttempts:        mapFloat(svcData, "DeliveryRetryAttempts"),
+		DeliveryRetryIntervalSeconds: mapFloat(svcData, "DeliveryRetryIntervalSeconds"),
+	}
+	// EventTypesForSubscription lists supported types (e.g. Alert, StatusChange, ResourceUpdated).
+	if typesArr, ok := svcData["EventTypesForSubscription"].([]interface{}); ok {
+		for _, t := range typesArr {
+			if ts, ok := t.(string); ok {
+				svcInfo.EventTypesForSubscription = append(svcInfo.EventTypesForSubscription, ts)
+			}
+		}
+	}
+
+	// Fetch subscription members — Dell iDRAC path: /redfish/v1/EventService/Subscriptions
+	subMembers, err := s.collectMembers(serverAddr, "/redfish/v1/EventService/Subscriptions")
+	if err != nil {
+		// Non-fatal: return service info with empty subscriptions rather than failing entirely.
+		s.logger.Warn("Failed to fetch EventService subscriptions", "error", err)
+		observeTool("get_alert_config", start, nil)
+		return nil, GetAlertConfigOutput{EventService: svcInfo, Subscriptions: []AlertSubscription{}}, nil
+	}
+
+	var subs []AlertSubscription
+	for _, m := range subMembers {
+		// EventTypes array — standard Redfish field
+		var eventTypes []string
+		if etArr, ok := m["EventTypes"].([]interface{}); ok {
+			for _, et := range etArr {
+				if ets, ok := et.(string); ok {
+					eventTypes = append(eventTypes, ets)
+				}
+			}
+		}
+
+		// Dell iDRAC uses "Status"."State" for subscription active/inactive state.
+		state := mapStr(m, "Status", "State")
+		if state == "" {
+			// Some iDRAC versions surface State directly on the subscription object.
+			state = mapStr(m, "State")
+		}
+
+		subs = append(subs, AlertSubscription{
+			Id:              mapStr(m, "Id"),
+			Destination:     mapStr(m, "Destination"),
+			Protocol:        mapStr(m, "Protocol"),
+			Context:         mapStr(m, "Context"),
+			EventTypes:      eventTypes,
+			// MessageSeverity is a Dell OEM extension for per-subscription severity filtering.
+			MessageSeverity: mapStr(m, "MessageSeverity"),
+			State:           state,
+		})
+	}
+
+	observeTool("get_alert_config", start, nil)
+	return nil, GetAlertConfigOutput{EventService: svcInfo, Subscriptions: subs}, nil
+}
+
 func (s *Server) handleDiscoverResources(ctx context.Context, req *mcp.CallToolRequest, input DiscoverResourcesInput) (*mcp.CallToolResult, DiscoverResourcesOutput, error) {
 	start := time.Now()
 	s.logger.Info("Handling discover_resources request")
@@ -825,4 +982,73 @@ func (s *Server) handleDiscoverResources(ctx context.Context, req *mcp.CallToolR
 
 	observeTool("discover_resources", start, nil)
 	return nil, DiscoverResourcesOutput{Links: links}, nil
+}
+
+// handleGetVirtualMedia returns the virtual media mount status for all slots
+// on the Dell iDRAC manager.
+//
+// Dell iDRAC path: /redfish/v1/Managers/iDRAC.Embedded.1/VirtualMedia
+// The Manager ID "iDRAC.Embedded.1" is Dell-specific.  Typical slot IDs are
+// "CD" (for ISO/CD-ROM images) and "RemovableDisk" (for USB/floppy images).
+// This is useful for PXE/provisioning workflows to confirm whether a boot ISO
+// is currently mounted before initiating a one-shot boot.
+func (s *Server) handleGetVirtualMedia(ctx context.Context, req *mcp.CallToolRequest, input GetVirtualMediaInput) (*mcp.CallToolResult, GetVirtualMediaOutput, error) {
+	start := time.Now()
+	s.logger.Info("Handling get_virtual_media request")
+
+	serverAddr := s.resolveServer(input.ServerAddress)
+	if serverAddr == "" {
+		err := fmt.Errorf("no server configured")
+		observeTool("get_virtual_media", start, err)
+		return nil, GetVirtualMediaOutput{}, err
+	}
+
+	// Fetch the VirtualMedia collection.
+	// Dell iDRAC path: /redfish/v1/Managers/iDRAC.Embedded.1/VirtualMedia
+	members, err := s.collectMembers(serverAddr, "/redfish/v1/Managers/iDRAC.Embedded.1/VirtualMedia")
+	if err != nil {
+		observeTool("get_virtual_media", start, err)
+		return nil, GetVirtualMediaOutput{}, fmt.Errorf("failed to get virtual media: %w", err)
+	}
+
+	var slots []VirtualMediaSlot
+	for _, m := range members {
+		// Extract the slot ID from the @odata.id path (last path segment).
+		odataID := mapStr(m, "@odata.id")
+		slotID := odataID
+		for i := len(odataID) - 1; i >= 0; i-- {
+			if odataID[i] == '/' {
+				slotID = odataID[i+1:]
+				break
+			}
+		}
+
+		// MediaTypes is an array field per Redfish VirtualMedia schema.
+		var mediaTypes []string
+		if mtArr, ok := m["MediaTypes"].([]interface{}); ok {
+			for _, mt := range mtArr {
+				if mts, ok := mt.(string); ok {
+					mediaTypes = append(mediaTypes, mts)
+				}
+			}
+		}
+
+		inserted, _ := m["Inserted"].(bool)
+		connected, _ := m["ConnectedVia"].(string)
+		writeProtected, _ := m["WriteProtected"].(bool)
+
+		slot := VirtualMediaSlot{
+			Id:             slotID,
+			Name:           mapStr(m, "Name"),
+			MediaTypes:     mediaTypes,
+			Inserted:       inserted,
+			Image:          mapStr(m, "Image"),
+			Connected:      connected != "" && connected != "NotConnected",
+			WriteProtected: writeProtected,
+		}
+		slots = append(slots, slot)
+	}
+
+	observeTool("get_virtual_media", start, nil)
+	return nil, GetVirtualMediaOutput{Slots: slots}, nil
 }

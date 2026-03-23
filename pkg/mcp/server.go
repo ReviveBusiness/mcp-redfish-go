@@ -146,10 +146,16 @@ func (s *Server) registerTools() error {
 		Description: "Discover available Redfish API resource endpoints on the server. Returns all top-level resource links (Systems, Chassis, Managers, etc.) with their @odata.id paths.",
 	}, s.handleDiscoverResources)
 
+	// Register get_alert_config tool
+	mcp.AddTool(s.mcpServer, &mcp.Tool{
+		Name:        "get_alert_config",
+		Description: "Show current alert/notification configuration: EventService enabled status and delivery retry policy, plus all subscriptions (destination, protocol, event types, severity filter, context, state). Read-only. Dell iDRAC paths: /redfish/v1/EventService and /redfish/v1/EventService/Subscriptions.",
+	}, s.handleGetAlertConfig)
+
 	// Register write/mutation tools (gated by REDFISH_READ_ONLY)
 	s.registerWriteTools()
 
-	s.logger.Info("MCP tools registered successfully", "count", 15)
+	s.logger.Info("MCP tools registered successfully", "count", 16)
 	return nil
 }
 
