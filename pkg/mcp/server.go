@@ -76,7 +76,7 @@ type GetResourceInput struct {
 // GetResourceOutput represents output for the get_resource_data tool
 type GetResourceOutput struct {
 	Headers map[string][]string `json:"headers"`
-	Data    interface{}         `json:"data"`
+	Data    map[string]interface{} `json:"data"`
 }
 
 // registerTools registers the MCP tools
@@ -313,7 +313,7 @@ func (s *Server) handleGetResourceData(ctx context.Context, req *mcp.CallToolReq
 
 	return nil, GetResourceOutput{
 		Headers: response.Headers,
-		Data:    response.Data,
+		Data:    toMapData(response.Data),
 	}, nil
 }
 

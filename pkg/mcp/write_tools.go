@@ -14,6 +14,17 @@ import (
 	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/redfish"
 )
 
+// toMapData safely converts an interface{} Redfish response body to
+// map[string]interface{}. Returns nil when the value is nil or not a map,
+// so callers always receive a type-safe value without panicking.
+func toMapData(v interface{}) map[string]interface{} {
+	if v == nil {
+		return nil
+	}
+	m, _ := v.(map[string]interface{})
+	return m
+}
+
 // validateSubscriptionID rejects IDs that contain path-traversal or reserved
 // characters and returns a path-escaped segment safe for URL interpolation.
 func validateSubscriptionID(id string) (string, error) {
@@ -97,9 +108,9 @@ type PowerActionInput struct {
 
 // PowerActionOutput represents the result of a power action.
 type PowerActionOutput struct {
-	StatusCode int         `json:"status_code"`
-	Message    string      `json:"message"`
-	Data       interface{} `json:"data,omitempty"`
+	StatusCode int                    `json:"status_code"`
+	Message    string                 `json:"message"`
+	Data       map[string]interface{} `json:"data,omitempty"`
 }
 
 // SetBootOverrideInput represents input for the set_boot_override tool.
@@ -111,9 +122,9 @@ type SetBootOverrideInput struct {
 
 // SetBootOverrideOutput represents the result of a boot override change.
 type SetBootOverrideOutput struct {
-	StatusCode int         `json:"status_code"`
-	Message    string      `json:"message"`
-	Data       interface{} `json:"data,omitempty"`
+	StatusCode int                    `json:"status_code"`
+	Message    string                 `json:"message"`
+	Data       map[string]interface{} `json:"data,omitempty"`
 }
 
 // ClearEventLogInput accepts an optional server address override.
@@ -123,9 +134,9 @@ type ClearEventLogInput struct {
 
 // ClearEventLogOutput represents the result of clearing the event log.
 type ClearEventLogOutput struct {
-	StatusCode int         `json:"status_code"`
-	Message    string      `json:"message"`
-	Data       interface{} `json:"data,omitempty"`
+	StatusCode int                    `json:"status_code"`
+	Message    string                 `json:"message"`
+	Data       map[string]interface{} `json:"data,omitempty"`
 }
 
 // SetBiosSettingInput represents input for the set_bios_setting tool.
@@ -137,10 +148,10 @@ type SetBiosSettingInput struct {
 
 // SetBiosSettingOutput represents the result of staging a BIOS attribute change.
 type SetBiosSettingOutput struct {
-	StatusCode int         `json:"status_code,omitempty"`
-	Message    string      `json:"message"`
-	Warning    string      `json:"warning"`
-	Data       interface{} `json:"data,omitempty"`
+	StatusCode int                    `json:"status_code,omitempty"`
+	Message    string                 `json:"message"`
+	Warning    string                 `json:"warning"`
+	Data       map[string]interface{} `json:"data,omitempty"`
 }
 
 // SetAlertConfigInput represents input for the set_alert_config tool.
@@ -157,9 +168,9 @@ type SetAlertConfigInput struct {
 
 // SetAlertConfigOutput represents the result of an alert configuration operation.
 type SetAlertConfigOutput struct {
-	StatusCode int         `json:"status_code,omitempty"`
-	Message    string      `json:"message"`
-	Data       interface{} `json:"data,omitempty"`
+	StatusCode int                    `json:"status_code,omitempty"`
+	Message    string                 `json:"message"`
+	Data       map[string]interface{} `json:"data,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -353,7 +364,7 @@ func (s *Server) handlePowerAction(ctx context.Context, req *mcp.CallToolRequest
 	return nil, PowerActionOutput{
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("Power action %s executed successfully (was %s)", input.ResetType, currentState),
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
 
@@ -408,7 +419,7 @@ func (s *Server) handleSetBootOverride(ctx context.Context, req *mcp.CallToolReq
 	return nil, SetBootOverrideOutput{
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("Boot override set to %s (%s)", input.Target, input.Enabled),
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
 
@@ -451,7 +462,7 @@ func (s *Server) handleClearEventLog(ctx context.Context, req *mcp.CallToolReque
 	return nil, ClearEventLogOutput{
 		StatusCode: response.StatusCode,
 		Message:    "iDRAC System Event Log cleared successfully",
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
 
@@ -512,7 +523,7 @@ func (s *Server) handleAlertList(serverAddr string) (*mcp.CallToolResult, SetAle
 	return nil, SetAlertConfigOutput{
 		StatusCode: response.StatusCode,
 		Message:    "Alert subscriptions retrieved successfully",
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
 
@@ -582,7 +593,7 @@ func (s *Server) handleAlertAdd(serverAddr string, input SetAlertConfigInput) (*
 	return nil, SetAlertConfigOutput{
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("Alert subscription added for %s (protocol: %s)", input.Destination, input.Protocol),
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
 
@@ -619,7 +630,7 @@ func (s *Server) handleAlertRemove(serverAddr string, input SetAlertConfigInput)
 	return nil, SetAlertConfigOutput{
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("Alert subscription %s removed successfully", input.SubscriptionID),
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
 
@@ -681,7 +692,7 @@ func (s *Server) handleSetBiosSetting(ctx context.Context, req *mcp.CallToolRequ
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("BIOS attribute '%s' staged to '%s' on %s", input.Attribute, input.Value, serverAddr),
 		Warning:    "Change is staged only — a system reboot is required for the new value to take effect. Use power_action with GracefulRestart to apply.",
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
 
@@ -761,6 +772,6 @@ func (s *Server) handleAlertUpdate(serverAddr string, input SetAlertConfigInput)
 	return nil, SetAlertConfigOutput{
 		StatusCode: response.StatusCode,
 		Message:    fmt.Sprintf("Alert subscription %s updated successfully", input.SubscriptionID),
-		Data:       response.Data,
+		Data:       toMapData(response.Data),
 	}, nil
 }
