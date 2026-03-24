@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
 	"slices"
 	"strings"
@@ -14,14 +15,20 @@ import (
 	"github.com/theoriginalaiexplorer/mcp-redfish-go/pkg/redfish"
 )
 
-// toMapData safely converts an interface{} Redfish response body to
-// map[string]interface{}. Returns nil when the value is nil or not a map,
-// so callers always receive a type-safe value without panicking.
+// toMapData safely converts an interface{} value to map[string]interface{}.
+// We use map[string]interface{} instead of interface{} for output Data fields because
+// the Go MCP SDK's jsonschema-go generates empty schema {} for interface{}, which strict
+// MCP clients (e.g., dot-ai's Zod validator) reject. map[string]interface{} generates
+// {"type": "object"} which is MCP-spec compliant. Redfish API always returns JSON objects.
 func toMapData(v interface{}) map[string]interface{} {
 	if v == nil {
 		return nil
 	}
-	m, _ := v.(map[string]interface{})
+	m, ok := v.(map[string]interface{})
+	if !ok {
+		log.Printf("WARNING: toMapData received %T instead of map[string]interface{}, data will be nil in MCP response", v)
+		return nil
+	}
 	return m
 }
 
