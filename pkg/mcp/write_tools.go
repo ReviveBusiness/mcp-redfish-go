@@ -41,6 +41,22 @@ func validateSubscriptionID(id string) (string, error) {
 	return url.PathEscape(id), nil
 }
 
+// redactURL strips path, query, fragment and userinfo from a URL string,
+// returning only "scheme://host". This prevents sensitive data (credentials
+// embedded in SNMP/syslog URLs, API keys in paths) from being written to logs.
+// If the URL cannot be parsed, the original string is replaced with "[REDACTED]".
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "[REDACTED]"
+	}
+	redacted := &url.URL{
+		Scheme: u.Scheme,
+		Host:   u.Host,
+	}
+	return redacted.String()
+}
+
 // ---------------------------------------------------------------------------
 // Write safety: per-server mutex + rate limiting
 // ---------------------------------------------------------------------------
@@ -162,15 +178,21 @@ type SetBiosSettingOutput struct {
 }
 
 // SetAlertConfigInput represents input for the set_alert_config tool.
+//
+// For action=update, Context, EventTypes and Severity are pointer types so the
+// handler can distinguish "field omitted" (nil) from "field explicitly set to
+// empty" (non-nil pointing to a zero value). This makes it possible to clear a
+// field that was previously set — passing nil leaves it unchanged on the server,
+// passing a non-nil pointer to an empty value clears it.
 type SetAlertConfigInput struct {
 	ServerAddressInput
-	Action         string   `json:"action" jsonschema:"Action to perform: list|add|remove|update"`
-	SubscriptionID string   `json:"subscription_id,omitempty" jsonschema:"Subscription ID, required for remove/update (e.g. 'SubscriptionId1')"`
-	Destination    string   `json:"destination,omitempty" jsonschema:"Target URL, required for add (e.g. 'snmp://10.0.0.1:162' or 'syslog://10.0.0.2:514')"`
-	Protocol       string   `json:"protocol,omitempty" jsonschema:"Alert protocol, required for add: SNMPv1|SNMPv2c|SNMPv3|Syslog|Redfish|SMTP"`
-	EventTypes     []string `json:"event_types,omitempty" jsonschema:"Event type filter: Alert, StatusChange, ResourceUpdated, ResourceAdded, ResourceRemoved"`
-	Severity       []string `json:"severity,omitempty" jsonschema:"Severity filter: OK, Warning, Critical"`
-	Context        string   `json:"context,omitempty" jsonschema:"Human-readable description of this subscription"`
+	Action         string    `json:"action" jsonschema:"Action to perform: list|add|remove|update"`
+	SubscriptionID string    `json:"subscription_id,omitempty" jsonschema:"Subscription ID, required for remove/update (e.g. 'SubscriptionId1')"`
+	Destination    string    `json:"destination,omitempty" jsonschema:"Target URL, required for add (e.g. 'snmp://10.0.0.1:162' or 'syslog://10.0.0.2:514')"`
+	Protocol       string    `json:"protocol,omitempty" jsonschema:"Alert protocol, required for add: SNMPv1|SNMPv2c|SNMPv3|Syslog|Redfish|SMTP"`
+	EventTypes     *[]string `json:"event_types,omitempty" jsonschema:"Event type filter: Alert, StatusChange, ResourceUpdated, ResourceAdded, ResourceRemoved"`
+	Severity       *[]string `json:"severity,omitempty" jsonschema:"Severity filter: OK, Warning, Critical"`
+	Context        *string   `json:"context,omitempty" jsonschema:"Human-readable description of this subscription"`
 }
 
 // SetAlertConfigOutput represents the result of an alert configuration operation.
@@ -233,7 +255,7 @@ func (s *Server) registerWriteTools() {
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
 		Name:        "set_alert_config",
-		Description: "[WRITE] Manage iDRAC alert destinations and filtering via EventService subscriptions (requires REDFISH_READ_ONLY=false). Actions: list (show current subscriptions), add (create new with destination URL, protocol, event type and severity filters), remove (delete by ID), update (patch existing). Supports protocols: SNMPv1, SNMPv2c, SNMPv3, Syslog, Redfish, SMTP.",
+		Description: "Manage iDRAC alert destinations and filtering via EventService subscriptions. action=list is read-only and works without REDFISH_READ_ONLY=false. All other actions (add, remove, update) are writes and require REDFISH_READ_ONLY=false. Actions: list (show current subscriptions), add (create new with destination URL, protocol, event type and severity filters), remove (delete by ID), update (patch existing). Supports protocols: SNMPv1, SNMPv2c, SNMPv3, Syslog, Redfish, SMTP.",
 	}, s.handleSetAlertConfig)
 
 	mcp.AddTool(s.mcpServer, &mcp.Tool{
@@ -548,16 +570,24 @@ func (s *Server) handleAlertAdd(serverAddr string, input SetAlertConfigInput) (*
 	}
 
 	// Validate optional event type filter
-	for _, et := range input.EventTypes {
-		if !slices.Contains(validEventTypes, et) {
-			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid event type: %s. Must be one of: %v", et, validEventTypes)
+	if input.EventTypes != nil {
+		for _, et := range *input.EventTypes {
+			if !slices.Contains(validEventTypes, et) {
+				return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid event type: %s. Must be one of: %v", et, validEventTypes)
+			}
 		}
 	}
 
-	// Validate optional severity filter
-	for _, sev := range input.Severity {
-		if !slices.Contains(validSeverities, sev) {
-			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid severity: %s. Must be one of: %v", sev, validSeverities)
+	// Validate optional severity filter — Redfish MessageSeverity is a single
+	// enum value; only one severity may be specified per subscription.
+	if input.Severity != nil {
+		if len(*input.Severity) > 1 {
+			return nil, SetAlertConfigOutput{}, fmt.Errorf("only one severity value is supported per subscription (got %d); Redfish MessageSeverity is a single enum, not an array", len(*input.Severity))
+		}
+		for _, sev := range *input.Severity {
+			if !slices.Contains(validSeverities, sev) {
+				return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid severity: %s. Must be one of: %v", sev, validSeverities)
+			}
 		}
 	}
 
@@ -573,19 +603,21 @@ func (s *Server) handleAlertAdd(serverAddr string, input SetAlertConfigInput) (*
 		"Destination": input.Destination,
 		"Protocol":    input.Protocol,
 	}
-	if len(input.EventTypes) > 0 {
-		body["EventTypes"] = input.EventTypes
+	if input.EventTypes != nil && len(*input.EventTypes) > 0 {
+		body["EventTypes"] = *input.EventTypes
 	}
-	if len(input.Severity) > 0 {
+	if input.Severity != nil && len(*input.Severity) > 0 {
 		// Redfish MessageSeverity is a single enum string, not an array.
-		// Use the first (highest-priority) value from the user-provided list.
-		body["MessageSeverity"] = input.Severity[0]
+		body["MessageSeverity"] = (*input.Severity)[0]
 	}
-	if input.Context != "" {
-		body["Context"] = input.Context
+	if input.Context != nil {
+		body["Context"] = *input.Context
 	}
 
-	s.logger.Warn("Adding alert subscription", "server", serverAddr, "destination", input.Destination, "protocol", input.Protocol)
+	// Redact destination URL before logging — strip path/query/credentials to
+	// avoid leaking sensitive config (e.g. SNMP community strings in URLs).
+	logDestination := redactURL(input.Destination)
+	s.logger.Warn("Adding alert subscription", "server", serverAddr, "destination", logDestination, "protocol", input.Protocol)
 
 	// NOTE: POST to /redfish/v1/EventService/Subscriptions creates a new subscription.
 	// Dell iDRAC returns 201 Created with the new subscription URL in the Location header.
@@ -676,7 +708,9 @@ func (s *Server) handleSetBiosSetting(ctx context.Context, req *mcp.CallToolRequ
 	}
 	defer release()
 
-	s.logger.Warn("Staging BIOS attribute change", "server", serverAddr, "attribute", input.Attribute, "value", input.Value)
+	// Log attribute name only — value is omitted because BIOS attributes can hold
+	// sensitive data (e.g. passwords, keys) and must not be sent to centralized logs.
+	s.logger.Warn("Staging BIOS attribute change", "server", serverAddr, "attribute", input.Attribute, "value", "[REDACTED]")
 
 	body := map[string]interface{}{
 		"Attributes": map[string]interface{}{
@@ -719,20 +753,30 @@ func (s *Server) handleAlertUpdate(serverAddr string, input SetAlertConfigInput)
 	}
 
 	// Validate optional event type filter
-	for _, et := range input.EventTypes {
-		if !slices.Contains(validEventTypes, et) {
-			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid event type: %s. Must be one of: %v", et, validEventTypes)
+	if input.EventTypes != nil {
+		for _, et := range *input.EventTypes {
+			if !slices.Contains(validEventTypes, et) {
+				return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid event type: %s. Must be one of: %v", et, validEventTypes)
+			}
 		}
 	}
 
-	// Validate optional severity filter
-	for _, sev := range input.Severity {
-		if !slices.Contains(validSeverities, sev) {
-			return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid severity: %s. Must be one of: %v", sev, validSeverities)
+	// Validate optional severity filter — Redfish MessageSeverity is a single
+	// enum value; only one severity may be specified per subscription.
+	if input.Severity != nil {
+		if len(*input.Severity) > 1 {
+			return nil, SetAlertConfigOutput{}, fmt.Errorf("only one severity value is supported per subscription (got %d); Redfish MessageSeverity is a single enum, not an array", len(*input.Severity))
+		}
+		for _, sev := range *input.Severity {
+			if !slices.Contains(validSeverities, sev) {
+				return nil, SetAlertConfigOutput{}, fmt.Errorf("invalid severity: %s. Must be one of: %v", sev, validSeverities)
+			}
 		}
 	}
 
-	// Build patch body — only include fields that were provided.
+	// Build patch body — only include fields that were explicitly provided.
+	// Pointer fields (EventTypes, Severity, Context): nil = omitted, non-nil = set
+	// (including non-nil pointer to empty value, which clears the field on the server).
 	body := map[string]interface{}{}
 	if input.Destination != "" {
 		body["Destination"] = input.Destination
@@ -740,16 +784,15 @@ func (s *Server) handleAlertUpdate(serverAddr string, input SetAlertConfigInput)
 	if input.Protocol != "" {
 		body["Protocol"] = input.Protocol
 	}
-	if len(input.EventTypes) > 0 {
-		body["EventTypes"] = input.EventTypes
+	if input.EventTypes != nil {
+		body["EventTypes"] = *input.EventTypes
 	}
-	if len(input.Severity) > 0 {
+	if input.Severity != nil && len(*input.Severity) > 0 {
 		// Redfish MessageSeverity is a single enum string, not an array.
-		// Use the first (highest-priority) value from the user-provided list.
-		body["MessageSeverity"] = input.Severity[0]
+		body["MessageSeverity"] = (*input.Severity)[0]
 	}
-	if input.Context != "" {
-		body["Context"] = input.Context
+	if input.Context != nil {
+		body["Context"] = *input.Context
 	}
 
 	if len(body) == 0 {
